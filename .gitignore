@@ -1,0 +1,18 @@
+# Arduino IDE / builds
+build/
+*.hex
+*.bin
+*.elf
+*.map
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editores
+.vscode/
+.idea/
+*.swp
+
+# Sistema
+Thumbs.db
+.DS_Store

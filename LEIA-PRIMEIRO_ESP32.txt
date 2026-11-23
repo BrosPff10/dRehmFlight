@@ -1,0 +1,264 @@
+================================================================================
+dRehmFlight ESP32 - PORT PARA ESTUDO DE TCC (jitter de loop + vibracao)
+================================================================================
+Base: dRehmFlight_Teensy_BETA_1.3 (Nicholas Rehm) - port para ESP32 DevKit
+com MPU6050 em I2C. Este firmware e para BANCADA/ESTUDO (instrumentacao de
+comparacao de temporizacao e vibracao), nao e um firmware de voo validado.
+
+Arquivos:
+  dRehmFlight_ESP32/dRehmFlight_ESP32.ino  - firmware principal
+  dRehmFlight_ESP32/radioComm.ino         - funcoes de radio (receptor DESATIVADO)
+  dRehmFlight_ESP32/src/                   - drivers embutidos (MPU6050/I2Cdev etc.)
+
+================================================================================
+1. RESUMO DAS MUDANCAS EM RELACAO AO UPSTREAM (Teensy)
+================================================================================
+- Biblioteca de servos: PWMServo (exclusiva Teensy) -> ESP32Servo (<ESP32Servo.h>),
+  tipo "Servo". As chamadas .write() foram MANTIDAS (ver secao 4).
+- Pinos remapeados para ESP32 DevKit (ver tabela 2). GPIOs 6-11 nao existem para
+  uso (ligados a flash) e GPIO 12 e strapping - por isso o remapeamento.
+- LED: pin 13 (Teensy) -> GPIO2 (ledPin).
+- Receptor PWM: DESATIVADO (sem attachInterrupt). Motivo duplo: o usuario nao tem
+  receptor, e os pinos padrao ch5=21/ch6=22 CONFLITAM com o I2C do MPU6050
+  (SDA=21/SCL=22). Os canais sao forcados por COMANDO SERIAL (ver secao 3).
+- I2C: Wire.setClock(1 MHz) do upstream -> 400000 (400 kHz, maximo do datasheet
+  do MPU6050). Desvio documentado: upstream usava 1 MHz porque no Teensy a
+  fiação e curta; aqui a fiação e em protoboard/jumper.
+- Instrumentacao TCC adicionada: linha STATS por segundo (jitter de loop e
+  vibracao) e medicao de vibração na IMU (ver secao 5).
+- Servo saidas: apenas servo1-4 anexados (GPIO 13/14/15/16). servo5-7 existem
+  mas nao sao anexados (write() de objeto nao anexado e no-op seguro na
+  ESP32Servo). O usuario nao usa saidas servo.
+- Nao ha outras dependencias novas: so Wire, SPI (ja no core) e ESP32Servo
+  (ja instalada). Drivers em src/ (MPU6050, MPU9250, SBUS, DSMRX, TFMPlus)
+  compilam no ESP32 sem alteracao (SBUS tem branch #elif defined(ESP32)).
+
+================================================================================
+2. TABELA DE PINOS (ESP32 DevKit)
+================================================================================
+Funcao                          GPIO    Observacao
+------------------------------- ------- -------------------------------------
+ESC A = m1 (Front Left)         19      PWM servo 400 Hz, 1000-2000 us (ESP32Servo)
+ESC B = m2 (Front Right)        18      PWM servo 400 Hz, 1000-2000 us
+ESC C = m4 (Back Left)          33      PWM servo 400 Hz, 1000-2000 us
+ESC D = m3 (Back Right)         32      PWM servo 400 Hz, 1000-2000 us
+Motor 5 (m5, nao usado)         25      sem saida (esc5 nao existe)
+Motor 6 (m6, nao usado)         26      sem saida (esc6 nao existe)
+Servo saida 1                   13      anexado via ESP32Servo (50 Hz, 900-2100us)
+Servo saida 2                   14      anexado
+Servo saida 3                   15      anexado
+Servo saida 4                   16      anexado
+Servo saida 5/6/7               --      NAO anexados (no-op)
+LED onboard                     2       pisca no loop (loopBlink/setupBlink)
+MPU6050 SDA                     21      default Wire do ESP32
+MPU6050 SCL                     22      default Wire do ESP32
+MPU6050 AD0/INT                 --      AD0 em GND (endereco 0x68); INT nao usado
+Serial (USB/UART0)              1/3     500000 baud (ponte USB-serial)
+Receptor PWM (ch1..ch6)         --      DESATIVADO (sem interrupts; 21/22 = I2C)
+LED do MPU6050 (se modulo tem)  --      módulos com LED azul: funciona normal
+
+Observacao de canais LEDC: 8 attaches = 8 canais LEDC usados (4 ESCs + 4
+servos; ESP32 classico tem 16 - sem risco de estouro).
+
+================================================================================
+3. COMANDOS SERIAIS (substituem o receptor de radio)
+================================================================================
+Abra o Monitor Serial a 500000 baud (ou mude Serial.begin se preferir 115200).
+Teclas (maiuscula ou minuscula):
+
+  'a' / 'A'  Libera o corte de acelerador (serCut=false -> ch5=1000).
+             Se o throttle estiver < 1050 us, armedStatus() ARMA o drone.
+             Com throttle em 1000 (minimo), os motores ficam no minimo (1000us).
+  'd' / 'D'  Ativa o corte (serCut=true -> ch5=2000). throttleCut() zera os
+             motores (1000us) e DESARMA (armedFly=false).
+  '+'        throttle +25 us (limitado a 2000)
+  '-'        throttle -25 us (limitado a 1000)
+  'p' / 'P'  Imprime: STATE: thr=... cut=... armed=... ch5=... roll=... pitch=... yaw=... vibRms=...
+
+Como funciona por dentro (canais confirmados no codigo original):
+  ch1 = throttle  (armedStatus arma se < 1050; integadores zeram se < 1060)
+  ch2 = roll      (forado em 1500 = centrado)
+  ch3 = pitch     (forado em 1500 = centrado)
+  ch4 = yaw       (forado em 1500 = centrado)
+  ch5 = gear/corte (armedStatus: <1500 armavel; throttleCut: >1500 corta/desarma)
+  ch6 = aux1      (nao forado; nao usado)
+O override e aplicado no FIM de cada loop(), DEPOIS de getCommands()+failSafe()
+e ANTES de armedStatus()/getDesState() do proximo ciclo - igual a logica do
+upstream. Como o bloco REESCREVE ch1..ch5 todo ciclo, o failSafe() (que ve
+valores 0 do RX desativado e tentaria forcar o failsafe) e anulado de forma
+explicita e deterministica.
+
+Seguranca: o sistema so arma com throttle em minimo; '+' varias vezes com 'a'
+envia throttle real aos ESCs. Motores: tire as hélices antes de qualquer teste.
+
+================================================================================
+4. write() vs writeMicroseconds() - DECISAO
+================================================================================
+Mantidas as chamadas .write() originais. Semantica verificada na fonte da
+ESP32Servo instalada (ESP32Servo.cpp, Servo::write):
+  value <  500 -> tratado como ANGULO 0-180, mapeado para [min,max] do attach
+  value >= 500 -> tratado como largura em MICROSEGUNDOS
+No firmware, scaleCommands() produz sX_command_PWM em 0..180 (angulos) e o
+setup usa write(0). Portanto esses cair no caminho de angulo, mapeado para
+900..2100 us (attach min/max) - identico ao comportamento PWMServo/Arduino
+Servo. JA A SAIDA DE MOTORES (esc1..4, adaptada do OneShot125 para PWM de
+servo 400 Hz) usa writeMicroseconds(mX_command_PWM) com valores 1000..2000
+direto, em commandMotors().
+Resolucao: com timer width padrao (10 bits) o passo e ~19,5 us por vez - para
+servos de controle 13-16, faca servoN.setTimerWidth(16) antes do attach se
+quiser precisao fina. Para os ESCs o passo grosso nao incomoda (o firmware de
+referencia do TCC tambem usa ESP32Servo com timer padrao).
+
+================================================================================
+5. INSTRUMENTACAO - LINHA STATS (definicoes EXATAS)
+================================================================================
+Uma linha por segundo na serial (a cada ~1 s de millis()):
+
+STATS,<bodyAvgUs>,<bodyMaxUs>,<estouros>,<perAvgUs>,<perMaxUs>,<perMinUs>,<vibRmsG>,<vibPeakG>,<alvoUs>,<ciclos>
+
+Campo            Tipo    Significado
+---------------  ------  ------------------------------------------------------
+bodyAvgUs        int     Media (na janela) do tempo de TRABALHO do ciclo
+bodyMaxUs        int     Maior tempo de trabalho observado na janela
+estouros         int     Ciclos com trabalho >= 0.8*alvo (= 400 us p/ alvo 500)
+perAvgUs         int     Media do periodo entre INICIOS de ciclo consecutivos
+perMaxUs         int     Maior periodo da janela (pico de jitter)
+perMinUs         int     Menor periodo da janela
+vibRmsG          float3  Media movel exponencial de | |a| - 1g | em g
+vibPeakG         float3  Maior desvio | |a| - 1g | da janela, em g
+alvoUs           int     Alvo teorico do loop (500 = 2 kHz)
+ciclos           int     Iteracoes contadas na janela de 1 s
+
+Definicoes exatas (o outro firmware DEVE usar as mesmas):
+- bodyUs = micros() no FIM do corpo do loop, ANTES da espera do loopRate().
+  Cobrem: IMU + Madgwick + PID + mixer + escrita de atuadores + leitura de
+  serial + override dos canais. NAO cobrem a espera ociosa do loopRate().
+- periodUs = distancia entre os INICIOS de dois ciclos consecutivos (inclui a
+  espera). Em regime, periodUs ~ 500 us (alvo). O primeiro periodUs pos-setup
+  e descartado.
+- estouro = bodyUs >= 0.8 * alvoDoLoop = 400 us (ciclo "cheio" demais para
+  sustentar 2 kHz).
+- Vibracao: calculada em getIMUdata(), IMEDIATAMENTE apos escala e filtro
+  passa-baixa da aceleracao (valores em g, mesmos que alimentam o Madgwick):
+      dev = fabs( sqrt(Ax^2+Ay^2+Az^2) - 1.0 )
+      vibRms += (dev - vibRms) * 0.01        (EWMA, alpha=0.01 por ciclo @2kHz
+                                              => tau ~ 50 ms; com janela de 1 s
+                                              o EWMA ~ RMS da janela)
+      vibPeak = max(vibPeak, dev)
+  A cada impressao, vibPeak E vibRms sao zerados (janela de 1 s).
+- A impressao usa Serial.printf; o UART do ESP32 tem buffer TX de 256 bytes,
+  entao a linha (~90 bytes) vai para o buffer e e transmitida em background -
+  o custo no loop e de poucos microssegundos, nao ~2 ms.
+
+Para comparar com outro firmware: replique exatamente os cinco pontos acima
+(local de medicao, 0.8*alvo, formula de dev, alpha=0.01, janela de 1 s).
+
+================================================================================
+6. COMO COMPILAR (arduino-cli, Windows/PowerShell)
+================================================================================
+& "C:\Users\dezin\AppData\Local\Temp\opencode\clitmp\arduino-cli.exe" compile --config-file "c:\Users\dezin\.arduinoIDE\arduino-cli.yaml" --fqbn "esp32:esp32:esp32:UploadSpeed=921600,CPUFreq=240,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default" --build-path "C:\Users\dezin\AppData\Local\Temp\opencode\compila_drehm" "C:\Users\dezin\Downloads\dRehmFlight_ESP32\dRehmFlight_ESP32"
+
+(Na Arduino IDE: basta abrir dRehmFlight_ESP32.ino com o board
+"ESP32 Dev Module" selecionado e a biblioteca ESP32Servo instalada.)
+
+O primeiro build demora varios minutos (o core ESP32 inteiro e compilado no
+build-path isolado). Builds seguintes sao rapidos.
+
+================================================================================
+7. COMO SUBIR NO ESP32 (upload)
+================================================================================
+Descubra a porta COM (Gerenciador de Dispositivos, normalmente COM3-COM8;
+ponte CH340/CP2102):
+
+& "C:\Users\dezin\AppData\Local\Temp\opencode\clitmp\arduino-cli.exe" upload --config-file "c:\Users\dezin\.arduinoIDE\arduino-cli.yaml" --fqbn "esp32:esp32:esp32:UploadSpeed=921600,CPUFreq=240,FlashFreq=80,FlashMode=qio,FlashSize=4M,PartitionScheme=default,DebugLevel=none,PSRAM=disabled,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default" --port COMx --input-dir "C:\Users\dezin\AppData\Local\Temp\opencode\compila_drehm"
+
+Ou, se preferir compilar de novo no upload: adicione o caminho do sketch no
+final do comando `arduino-cli upload` (sem --input-dir) e use --port COMx.
+Na IDE: selecione a porta COM e Ctrl+U. Mantenha o bootloader atual
+(modo "Do not change").
+
+Apos subir, abra o Monitor Serial a 500000 baud: veja o banner de comandos e
+as linhas STATS/. LED (GPIO2) pisca = loop rodando.
+
+================================================================================
+8. GANHOS E PARAMETROS (onde ajustar)
+================================================================================
+Tudo no proprio dRehmFlight_ESP32.ino, secao USER-SPECIFIED VARIABLES:
+  - Filtros: B_madgwick (0.04), B_accel (0.14), B_gyro (0.1) - ajustados p/ 2 kHz
+  - PID angulo: Kp/Ki/Kd_roll_angle, Kp/Ki/Kd_pitch_angle, B_loop_roll/pitch
+  - PID rate:   Kp/Ki/Kd_roll_rate, Kp/Ki/Kd_pitch_rate, Kp/Ki/Kd_yaw
+  - Limites: i_limit (25), maxRoll/maxPitch (30 grau), maxYaw (160 grau/s)
+  - Calibracao IMU: AccErrorX/Y/Z, GyroErrorX/Y/Z (zeras por padrao)
+Taxa do loop: loopRate(2000) no fim de loop() e em calibrateAttitude().
+Mixer (quad X): controlMixer() - m1=Front Left, m2=Front Right, m3=Back Right,
+m4=Back Left.
+Protocolo dos ESCs: ADAPTADO para PWM de servo 400 Hz / 1000-2000 us
+(commandMotors() via ESP32Servo, esc1..4 nos pinos m1-m4) - MESMO protocolo,
+frequencia e faixa do firmware de referencia do TCC. O upstream usa
+OneShot125 (125-250 us bit-bang), que os ESCs SimonK HW-30A do usuario NAO
+interpretam; o codigo original OneShot125 ficou comentado/documentado para
+restauracao futura (a pasta Downloads\dRehmFlight tem o fonte intacto).
+
+================================================================================
+9. CALIBRACAO (igual ao original)
+================================================================================
+- Gyro/Acel: com o drone nivelado e parado, descomente calculate_IMU_error()
+  em setup(). Ele imprime no serial os valores "float AccErrorX = ...;" etc.
+  Cole-os nas variaveis USER-SPECIFIED e comente a funcao de novo.
+- ESCs (PROPS OFF!): descomente calibrateESCs() em setup() para o procedimento
+  de calibracao classico (throttle max ao ligar, baixar apos os bipes). O
+  codigo nao passa dela enquanto estiver descomentada.
+- Orientacao da IMU: NAO ha rotina de rotacao/mount no dRehmFlight - a
+  convencao assumida (padrao, vale aqui) e IMU PLANA e alinhada com o frame,
+  eixos X frente, Y esquerda, Z cima (NWU), com roll_IMU/pitch_IMU zerados
+  quando o modelo esta nivelado. O MPU6050 do usuario esta plano sobre o F450 =
+  configuracao default, nenhuma mudanca necessaria. Se virar a IMU 90 grau,
+  teria que trocar sinais nas chamadas de getIMUdata()/Madgwick() (nao ha
+  define pronto).
+
+================================================================================
+10. RESSALVAS / O QUE TESTAR NO HARDWARE
+================================================================================
+- TAXA REAL DO LOOP: o upstream assume 2 kHz, mas no ESP32 o custo e diferente
+  (I2C a 400 kHz, printf, etc.). OLHE as linhas STATS: se perAvgUs > 500, o
+  loop nao sustenta 2 kHz e os parametros B_* estao fora do ponto para a taxa
+  real. E justamente isso que o estudo de TCC quer medir.
+- RECEPTOR DESATIVADO: nao ha como armar por radio; tudo via serial. Se um dia
+  for reativar, troque os pinos chXPin (21/22 conflitam com I2C!) e remova o
+  #if 0 do radioSetup().
+- I2C A 400 kHz (desvio do upstream de 1 MHz): valido no datasheet; se aparecer
+  "MPU6050 initialization unsuccessful" ou leituras congeladas, verifique
+  fiação/energia do modulo (bancada curta deve funcionar).
+- FALTA DE MPU6050: o firmware fica em while(1) e o Task WDT do ESP32 reinicia
+  o chip em loop (~5 s). Se o board ficar resetando sozinho, e o MPU6050 que
+  nao respondeu (fiação/alimentacao/endereco 0x68).
+- OneShot125 vs PWM: RESOLVIDO NA ADAPTACAO. O upstream comanda os ESCs com
+  pulsos de 125-250 us bit-bangados (OneShot125); os ESCs SimonK HW-30A do
+  usuario nao interpretam esse protocolo. commandMotors() foi trocado por
+  ESP32Servo.writeMicroseconds(1000..2000) a 400 Hz nos pinos m1-m4 - igual
+  ao firmware de referencia (esc1..4, ESC_FREQ_HZ=400). BONUS: o bit-bang
+  travava ~250 us do ciclo; com LEDC o corpo do loop encurta bastante (veja
+  bodyAvgUs no STATS). Se um dia usar ESC BLHeli/OneShot, restaure o codigo
+  original de commandMotors()/scaleCommands() ( Downloads\dRehmFlight ).
+- Serial a 500000 baud: a maioria das pontes CH340/CP2102 aceita; se aparecer
+  lixo no monitor, mude Serial.begin para 115200 (afina levemente o custo do
+  loop).
+- No boot aparecem linhas "Attempting/Success to Attach servo..." - sao logs
+  ESP_LOGW da ESP32Servo a cada attach() de servo1-4 (inofensivos; use-os para
+  confirmar os GPIOs 13/14/15/16).
+- CPU 240 MHz, cores: loop no core 1 (LoopCore=1). Nada de WiFi/BT ligado.
+- NUNCA teste com hélices montadas; o '+' serial aumenta throttle de verdade.
+- Calibracao de gyro/accel: como no original (secao 9) - sem ela, o roll/pitch
+  de repouso nao fica em zero.
+
+================================================================================
+11. NUMEROS DE COMPILACAO (arduino-cli, core esp32 3.3.7)
+================================================================================
+Compilado com exit code 0 e ZERO warnings na primeira build completa:
+  Sketch uses 342055 bytes (26%) of program storage space. Maximum is 1310720 bytes.
+  Global variables use 25504 bytes (7%) of dynamic memory, leaving 302176 bytes
+  for local variables. Maximum is 327680 bytes.
+Nota: as mensagens "#pragma message" de Bluetooth que aparecem no console sao
+do proprio core ESP32 (note, nao e erro) e nao influenciam a build. Ao usar
+2>&1 em PowerShell, o PowerShell as converte em ErrorRecords e o comando
+pode reportar exit 1 indevidamente - sem o redirecionamento, o exit e 0.

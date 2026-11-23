@@ -1,19 +1,17 @@
 //Arduino/Teensy Flight Controller - dRehmFlight
 //Author: Nicholas Rehm
 //Project Start: 1/6/2020
-//Version: Beta 1.2
-
-/*
- * 
- * If you are using this for an academic or scholarly project, please credit me in any presentations or publications:
- *
- * Nicholas Rehm
- * Department of Aerospace Engineering
- * University of Maryland
- * College Park 20742
- * Email: nrehm@umd.edu
- *
- */
+//Last Updated: 7/29/2022
+//Version: Beta 1.3
+//
+//*** PORT PARA ESP32 (TCC - instrumentacao jitter de loop + vibracao) ***
+//Base: dRehmFlight_Teensy_BETA_1.3. Alteracoes principais:
+// - PWMServo (Teensy) substituido por ESP32Servo (tipo "Servo")
+// - Receptor PWM desativado (sem interrupts); canais forcados por comando serial
+// - Pinos remapeados para ESP32 DevKit (ver DECLARE PINS)
+// - I2C a 400 kHz (upstream usa 1 MHz; fiação em protoboard)
+// - Instrumentacao STATS (1 Hz) e medicao de vibracao na IMU
+//Ver LEIA-PRIMEIRO_ESP32.txt na pasta do projeto para detalhes.
  
 //========================================================================================================================//
 
@@ -22,20 +20,16 @@
 Some elements inspired by:
 http://www.brokking.net/ymfc-32_main.html
 
-Skeleton code for reading and initializing MPU6050 borrowed from:
-https://howtomechatronics.com/tutorials/arduino/arduino-and-mpu6050-accelerometer-and-gyroscope-tutorial/
-
 Madgwick filter function adapted from:
 https://github.com/arduino-libraries/MadgwickAHRS
 
-MPU9250 implementation based on MPU9250 library by
+MPU9250 implementation based on MPU9250 library by:
 brian.taylor@bolderflight.com
 http://www.bolderflight.com
 
-
 Thank you to:
-
-RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
+RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation.
+Everyone that sends me pictures and videos of your flying creations! -Nick
 
 */
 
@@ -46,22 +40,29 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 //========================================================================================================================//
 
 //Uncomment only one receiver type
+//NOTA (port ESP32): o receptor PWM esta DESATIVADO abaixo (radioSetup() com #if 0).
+//O motivo e duplo: (1) o usuario do ESP32 nao possui receptor de radio e (2) os pinos
+//padrao do PWM RX (ch5=21 e ch6=22) CONFLITAM com o barramento I2C do MPU6050
+//(SDA=21/SCL=22 nos defaults do ESP32), entao as interrupts NAO podem ser anexadas.
+//Os canais sao forcados por comando serial no fim de cada loop() - ver pollSerialCommands().
 #define USE_PWM_RX
 //#define USE_PPM_RX
 //#define USE_SBUS_RX
+//#define USE_DSM_RX
+static const uint8_t num_DSM_channels = 6; //If using DSM RX, change this to match the number of transmitter channels you have
 
 //Uncomment only one IMU
-#define USE_MPU6050_I2C //default
+#define USE_MPU6050_I2C //Default
 //#define USE_MPU9250_SPI
 
 //Uncomment only one full scale gyro range (deg/sec)
-#define GYRO_250DPS //default
+#define GYRO_250DPS //Default
 //#define GYRO_500DPS
 //#define GYRO_1000DPS
 //#define GYRO_2000DPS
 
 //Uncomment only one full scale accelerometer range (G's)
-#define ACCEL_2G //default
+#define ACCEL_2G //Default
 //#define ACCEL_4G
 //#define ACCEL_8G
 //#define ACCEL_16G
@@ -76,10 +77,20 @@ RcGroups 'jihlein' - IMU implementation overhaul + SBUS implementation
 
 #include <Wire.h>     //I2c communication
 #include <SPI.h>      //SPI communication
-#include <PWMServo.h> //commanding any extra actuators, installed with teensyduino installer
+#include <ESP32Servo.h> //Commanding any extra actuators - PORT ESP32: substitui o PWMServo (exclusivo Teensy).
+//Semantica verificada na fonte da ESP32Servo (ESP32Servo.cpp, Servo::write):
+//  - value < 500  -> tratado como ANGULO (0-180), mapeado para [min,max] do attach()
+//  - value >= 500 -> tratado como largura em MICROSEGUNDOS
+//Como scaleCommands() produz sX_command_PWM no intervalo 0-180 (angulos) e o setup usa
+//write(0) (= 900us com attach(pin,900,2100)), as chamadas .write() originais funcionam
+//com a MESMA semantica do PWMServo/Arduino Servo - NAO ha necessidade de writeMicroseconds().
 
 #if defined USE_SBUS_RX
   #include "src/SBUS/SBUS.h"   //sBus interface
+#endif
+
+#if defined USE_DSM_RX
+  #include "src/DSMRX/DSMRX.h"  
 #endif
 
 #if defined USE_MPU6050_I2C
@@ -176,19 +187,27 @@ float MagScaleX = 1.0;
 float MagScaleY = 1.0;
 float MagScaleZ = 1.0;
 
+//IMU calibration parameters - calibrate IMU using calculate_IMU_error() in the void setup() to get these values, then comment out calculate_IMU_error()
+float AccErrorX = 0.0;
+float AccErrorY = 0.0;
+float AccErrorZ = 0.0;
+float GyroErrorX = 0.0;
+float GyroErrorY= 0.0;
+float GyroErrorZ = 0.0;
+
 //Controller parameters (take note of defaults before modifying!): 
 float i_limit = 25.0;     //Integrator saturation level, mostly for safety (default 25.0)
-float maxRoll = 30.0;     //Max roll angle in degrees for angle mode (maximum 60 degrees), deg/sec for rate mode 
-float maxPitch = 30.0;    //Max pitch angle in degrees for angle mode (maximum 60 degrees), deg/sec for rate mode
+float maxRoll = 30.0;     //Max roll angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode 
+float maxPitch = 30.0;    //Max pitch angle in degrees for angle mode (maximum ~70 degrees), deg/sec for rate mode
 float maxYaw = 160.0;     //Max yaw rate in deg/sec
 
 float Kp_roll_angle = 0.2;    //Roll P-gain - angle mode 
 float Ki_roll_angle = 0.3;    //Roll I-gain - angle mode
-float Kd_roll_angle = 0.05;   //Roll D-gain - angle mode (if using controlANGLE2(), set to 0.0)
+float Kd_roll_angle = 0.05;   //Roll D-gain - angle mode (has no effect on controlANGLE2)
 float B_loop_roll = 0.9;      //Roll damping term for controlANGLE2(), lower is more damping (must be between 0 to 1)
 float Kp_pitch_angle = 0.2;   //Pitch P-gain - angle mode
 float Ki_pitch_angle = 0.3;   //Pitch I-gain - angle mode
-float Kd_pitch_angle = 0.05;  //Pitch D-gain - angle mode (if using controlANGLE2(), set to 0.0)
+float Kd_pitch_angle = 0.05;  //Pitch D-gain - angle mode (has no effect on controlANGLE2)
 float B_loop_pitch = 0.9;     //Pitch damping term for controlANGLE2(), lower is more damping (must be between 0 to 1)
 
 float Kp_roll_rate = 0.15;    //Roll P-gain - rate mode
@@ -208,38 +227,54 @@ float Kd_yaw = 0.00015;       //Yaw D-gain (be careful when increasing too high,
 //                                                     DECLARE PINS                                                       //                           
 //========================================================================================================================//                                          
 
-//NOTE: Pin 13 is reserved for onboard LED, pins 18 and 19 are reserved for the MPU6050 IMU for default setup
+//NOTE: Port ESP32 - pinos remapeados para o ESP32 DevKit. NAO usar GPIO 6-11 (ligados a flash).
 //Radio:
-//Note: If using SBUS, connect to pin 21 (RX5)
+//NOTA: os pinos chXPin/PPM_Pin abaixo sao mantidos apenas para o codigo compilar;
+//o receptor PWM esta DESATIVADO (sem attachInterrupt - ch5=21/ch6=22 conflitariam com o I2C).
 const int ch1Pin = 15; //throttle
 const int ch2Pin = 16; //ail
 const int ch3Pin = 17; //ele
 const int ch4Pin = 20; //rudd
-const int ch5Pin = 21; //gear (throttle cut)
-const int ch6Pin = 22; //aux1 (free aux channel)
+const int ch5Pin = 21; //gear (throttle cut) - CONFLITA com SDA (21): interrupts desativados
+const int ch6Pin = 22; //aux1 - CONFLITA com SCL (22): interrupts desativados
 const int PPM_Pin = 23;
-//OneShot125 ESC pin outputs:
-const int m1Pin = 0;
-const int m2Pin = 1;
-const int m3Pin = 2;
-const int m4Pin = 3;
-const int m5Pin = 4;
-const int m6Pin = 5;
+//OneShot125 ESC pin outputs: (ESCs A/B/C/D do usuario, mesma ordem do firmware de referencia)
+//ATENCAO (TCC): no mixer do dRehmFlight m3=Back Right e m4=Back Left, mas o
+//firmware de referencia rotula C=Back LEFT (pin 33) e D=Back RIGHT (pin 32).
+//Para os DOIS FIRMWARES valerem da MESMA fiação, os pinos m3/m4 estao TROCADOS
+//em relacao ao upstream: m3=32 (Back Right = ESC D) e m4=33 (Back Left = ESC C).
+const int m1Pin = 19; //ESC A (GPIO19) = Front Left
+const int m2Pin = 18; //ESC B (GPIO18) = Front Right
+const int m3Pin = 32; //m3 = Back Right = ESC D do firmware de referencia (GPIO32)
+const int m4Pin = 33; //m4 = Back Left = ESC C do firmware de referencia (GPIO33)
+const int m5Pin = 25; //livre/seguro (nao usado pelo usuario)
+const int m6Pin = 26; //livre/seguro (nao usado pelo usuario)
 //PWM servo or ESC outputs:
-const int servo1Pin = 6;
-const int servo2Pin = 7;
-const int servo3Pin = 8;
-const int servo4Pin = 9;
-const int servo5Pin = 10;
-const int servo6Pin = 11;
-const int servo7Pin = 12;
-PWMServo servo1;  //create servo object to control a servo or ESC with PWM
-PWMServo servo2;
-PWMServo servo3;
-PWMServo servo4;
-PWMServo servo5;
-PWMServo servo6;
-PWMServo servo7;
+const int servo1Pin = 13; //Port ESP32: 13/14/15/16 sao GPIOs validos para LEDC (os 6-12 do Teensy
+const int servo2Pin = 14; //nao existem no ESP32: 6-11 sao pins de flash e 12 e strapping)
+const int servo3Pin = 15;
+const int servo4Pin = 16;
+//servo5-7: NAO anexados (o usuario nao usa saidas servo extras; anexar so desperdicaria
+//canais LEDC). Os .write() de servo nao anexado sao NO-OP SEGURO (ESP32Servo.cpp:
+//writeTicks() so grava se this->attached() for true).
+//servo5-7: criados mas NAO anexados (o usuario nao usa saidas servo extras; anexar so
+//desperdicaria canais LEDC). Os .write() em servo nao anexado sao NO-OP SEGURO
+//(ESP32Servo.cpp: writeTicks() so grava se this->attached() for true).
+Servo servo1;  //Create servo objects to control a servo or ESC with PWM (ESP32Servo)
+Servo servo2;
+Servo servo3;
+Servo servo4;
+Servo servo5;  //nao anexado - write() e no-op
+Servo servo6;  //nao anexado - write() e no-op
+Servo servo7;  //nao anexado - write() e no-op
+
+//ESCs do usuario: PWM de servo 400 Hz, 1000-2000 us - MESMA saida do firmware
+//de referencia do TCC (o OneShot125 original nao e suportado pelos ESCs
+//SimonK HW-30A; ver commandMotors() e scaleCommands())
+Servo esc1, esc2, esc3, esc4;
+constexpr int ESC_FREQ_HZ = 400; //Hz - identico ao firmware de referencia
+//Port ESP32 (TCC): LED do DevKit e instrumentacao de loop
+const int ledPin = 2; //LED onboard tipico dos ESP32 DevKit (substitui o pin 13 do Teensy)
 
 
 
@@ -256,7 +291,7 @@ unsigned long print_counter, serial_counter;
 unsigned long blink_counter, blink_delay;
 bool blinkAlternate;
 
-//Radio comm:
+//Radio communication:
 unsigned long channel_1_pwm, channel_2_pwm, channel_3_pwm, channel_4_pwm, channel_5_pwm, channel_6_pwm;
 unsigned long channel_1_pwm_prev, channel_2_pwm_prev, channel_3_pwm_prev, channel_4_pwm_prev;
 
@@ -265,6 +300,9 @@ unsigned long channel_1_pwm_prev, channel_2_pwm_prev, channel_3_pwm_prev, channe
   uint16_t sbusChannels[16];
   bool sbusFailSafe;
   bool sbusLostFrame;
+#endif
+#if defined USE_DSM_RX
+  DSM1024 DSM;
 #endif
 
 //IMU:
@@ -276,8 +314,7 @@ float MagX, MagY, MagZ;
 float MagX_prev, MagY_prev, MagZ_prev;
 float roll_IMU, pitch_IMU, yaw_IMU;
 float roll_IMU_prev, pitch_IMU_prev;
-float AccErrorX, AccErrorY, AccErrorZ, GyroErrorX, GyroErrorY, GyroErrorZ;
-float q0 = 1.0f; //initialize quaternion for madgwick filter
+float q0 = 1.0f; //Initialize quaternion for madgwick filter
 float q1 = 0.0f;
 float q2 = 0.0f;
 float q3 = 0.0f;
@@ -297,36 +334,74 @@ int m1_command_PWM, m2_command_PWM, m3_command_PWM, m4_command_PWM, m5_command_P
 float s1_command_scaled, s2_command_scaled, s3_command_scaled, s4_command_scaled, s5_command_scaled, s6_command_scaled, s7_command_scaled;
 int s1_command_PWM, s2_command_PWM, s3_command_PWM, s4_command_PWM, s5_command_PWM, s6_command_PWM, s7_command_PWM;
 
+//Flight status
+bool armedFly = false;
 
+//========================================================================================================================//
+//                                    INSTRUMENTACAO TCC (jitter de loop + vibracao)                                     //
+//========================================================================================================================//
+//Definicoes EXATAS usadas neste firmware (o firmware de comparacao deve usar as mesmas):
+// - bodyUs: tempo de trabalho do ciclo = micros() no fim do corpo do loop, ANTES da espera do loopRate().
+// - periodUs: distancia entre os INICIOS de dois ciclos consecutivos (inclui a espera do loopRate).
+// - estouro: bodyUs >= 4000 us - MESMA definicao do firmware de referencia
+//   ("quantas vezes o loop passou de 4000 us" = trava real de 4 ms).
+//   (o valor antigo 0.8*alvo=400 us ficava SATURADO a 100%: o corpo deste loop
+//    tem 931 us e sempre passava de 400 us - nao media nada.)
+// - vibRms: media movel exponencial (alpha = 0.01 por ciclo @2kHz, tau ~ 50 ms) de
+//   | |a| - 1g |, com a = acelerafiltrada ja escalada em g (mesma que entra no Madgwick).
+// - vibPeak: maior desvio | |a| - 1g | da janela de 1 s (zerado a cada impressao).
+const unsigned long LOOP_TARGET_US = 500; //alvo do loopRate(2000) em us
+const unsigned long ESTOURO_LIMITE_US = 4000; //TCC: trava real >= 4 ms, igual o firmware de referencia
+//Acumuladores da janela de 1 s (zerados a cada impressao de STATS):
+unsigned long statsBodySum = 0, statsBodyMax = 0, statsEstouros = 0, statsCiclos = 0;
+//PORT ESP32 (TCC): log rapido opcional (tecla 'l') p/ graficos de resposta - ~100 Hz
+bool logFast = false;
+int logFastN = 0;
+unsigned long statsPerSum = 0, statsPerMax = 0, statsPerMin = 0xFFFFFFFF;
+unsigned long statsLastLoopStartUs = 0; //base p/ periodUs
+unsigned long statsPrintTimerMs = 0;     // millis() da ultima impressao STATS
+bool statsPrimed = false;               //descarta o primeiro periodUs (contem a espera do setup)
+//Vibracao:
+float vibRms = 0.0f;
+float vibPeak = 0.0f;
+//Comando serial substituto do receptor (receptor PWM desativado neste port):
+unsigned long serThrottle = 1000; //vira channel_1_pwm (throttle); 1000 = minimo
+bool serCut = false;              //false = NAO cortado (permite armar); true = corte (desarma)
 
 //========================================================================================================================//
 //                                                      VOID SETUP                                                        //                           
 //========================================================================================================================//
 
 void setup() {
-  Serial.begin(500000); //usb serial
-  delay(3000); //3 second delay for plugging in battery before IMU calibration begins, feel free to comment this out to reduce boot time
+  Serial.begin(500000); //USB serial
+  delay(500);
   
   //Initialize all pins
-  pinMode(13, OUTPUT); //pin 13 LED blinker on board, do not modify 
+  pinMode(ledPin, OUTPUT); //Port ESP32: LED onboard (era pin 13 no Teensy)
   pinMode(m1Pin, OUTPUT);
   pinMode(m2Pin, OUTPUT);
   pinMode(m3Pin, OUTPUT);
   pinMode(m4Pin, OUTPUT);
   pinMode(m5Pin, OUTPUT);
   pinMode(m6Pin, OUTPUT);
-  servo1.attach(servo1Pin, 900, 2100); //pin, min PWM value, max PWM value
+  //Port ESP32: anexa apenas servo1-4 (servo5-7 ficam desanexados; write() deles e no-op)
+  servo1.attach(servo1Pin, 900, 2100); //Pin, min PWM value, max PWM value
   servo2.attach(servo2Pin, 900, 2100);
   servo3.attach(servo3Pin, 900, 2100);
   servo4.attach(servo4Pin, 900, 2100);
-  servo5.attach(servo5Pin, 900, 2100);
-  servo6.attach(servo6Pin, 900, 2100);
-  servo7.attach(servo7Pin, 900, 2100);
+  // ESCs do usuario (SimonK HW-30A): PWM 400 Hz / 1000-2000 us nos pinos m1-m4
+  esc1.setPeriodHertz(ESC_FREQ_HZ); esc1.attach(m1Pin, 1000, 2000);
+  esc2.setPeriodHertz(ESC_FREQ_HZ); esc2.attach(m2Pin, 1000, 2000);
+  esc3.setPeriodHertz(ESC_FREQ_HZ); esc3.attach(m3Pin, 1000, 2000);
+  esc4.setPeriodHertz(ESC_FREQ_HZ); esc4.attach(m4Pin, 1000, 2000);
+  //servo5.attach(servo5Pin, 900, 2100); //nao usado neste setup ESP32
+  //servo6.attach(servo6Pin, 900, 2100);
+  //servo7.attach(servo7Pin, 900, 2100);
 
-  //Set built in LED to turn on to signal startup & not to disturb vehicle during IMU calibration
-  digitalWrite(13, HIGH);
+  //Set built in LED to turn on to signal startup
+  digitalWrite(ledPin, HIGH);
 
-  delay(10);
+  delay(5);
 
   //Initialize radio communication
   radioSetup();
@@ -339,46 +414,57 @@ void setup() {
   channel_5_pwm = channel_5_fs;
   channel_6_pwm = channel_6_fs;
 
+  //Port ESP32: estado inicial do comando serial que substitui o receptor.
+  //serCut=false => ch5=1000 (NAO cortado); serThrottle=1000 (throttle minimo).
+  //Com o throttle em 1000 e ch5 em 1000, armedStatus() arma com motores no minimo (seguro).
+  serThrottle = 1000;
+  serCut = false;
+  statsPrintTimerMs = millis();
+  Serial.println("dRehmFlight ESP32 (port TCC) - receptor DESATIVADO, comando serial ativo:");
+  Serial.println("  'a' = liberar corte (permite armar) | 'd' = cortar acelerador (desarma)");
+  Serial.println("  '+' / '-' = throttle +/-25us (1000..2000) | 'p' = estado | 'c' = recalibrar IMU | 'l' = log 100Hz");
+  Serial.println("  Linha STATS a cada 1s: STATS,bodyAvg,bodyMax,estouros,perAvg,perMax,perMin,vibRmsG,vibPeakG,alvo,ciclos");
+
   //Initialize IMU communication
   IMUinit();
 
-  delay(10);
+  delay(5);
 
-  //Get IMU error to zero accelerometer and gyro readings, assuming vehicle is level
+  //Get IMU error to zero accelerometer and gyro readings, assuming vehicle is level when powered up
+  //PORT ESP32 (TCC): calibracao AUTOMATICA a cada ligacao - mesmo tratamento do firmware
+  //de referencia (calibrarIMU() roda no boot dele). Exige drone PARADO e NIVELADO ao ligar
+  //~5 s (12000 amostras): zera o viés do gyro (foi medido ~8.6 dps de fantasma na referencia)
+  //e do accel. Se mexer durante a calibracao: reboot ou tecle 'c' depois (desarmado).
   calculate_IMU_error();
 
-  delay(10);
-
   //Arm servo channels
-  servo1.write(0); //command servo angle from 0-180 degrees (1000 to 2000 PWM)
-  servo2.write(0);
-  servo3.write(0);
+  servo1.write(0); //Command servo angle from 0-180 degrees (1000 to 2000 PWM)
+  servo2.write(0); //Set these to 90 for servos if you do not want them to briefly max out on startup
+  servo3.write(0); //Keep these at 0 if you are using servo outputs for motors
   servo4.write(0);
   servo5.write(0);
   servo6.write(0);
   servo7.write(0);
   
-  delay(10);
+  delay(5);
 
-  //Arm OneShot125 motors
-  m1_command_PWM = 125; //command OneShot125 ESC from 125 to 250us pulse length
-  m2_command_PWM = 125;
-  m3_command_PWM = 125;
-  m4_command_PWM = 125;
-  m5_command_PWM = 125;
-  m6_command_PWM = 125;
-  commandMotors();
-  
-  delay(100);
+  //calibrateESCs(); //PROPS OFF. Uncomment this to calibrate your ESCs by setting throttle stick to max, powering on, and lowering throttle to zero after the beeps
+  //Code will not proceed past here if this function is uncommented!
 
-  //Warm up the loop
-  calibrateAttitude(); //helps to warm up IMU and Madgwick filter before finally entering main loop
+  //Arm ESCs (PWM de servo: minimo = 1000 us; no original OneShot125 era 125)
+  m1_command_PWM = 1000;
+  m2_command_PWM = 1000;
+  m3_command_PWM = 1000;
+  m4_command_PWM = 1000;
+  m5_command_PWM = 1000;
+  m6_command_PWM = 1000;
+  armMotors(); //Loop over commandMotors() until ESCs happily arm
   
   //Indicate entering main loop with 3 quick blinks
   setupBlink(3,160,70); //numBlinks, upTime (ms), downTime (ms)
 
   //If using MPU9250 IMU, uncomment for one-time magnetometer calibration (may need to repeat for new locations)
-  //calibrateMagnetometer(); //generates magentometer error and scale factors
+  //calibrateMagnetometer(); //Generates magentometer error and scale factors to be pasted in user-specified variables section
 
 }
 
@@ -389,59 +475,113 @@ void setup() {
 //========================================================================================================================//
                                                   
 void loop() {
+  //===== PORT ESP32 (TCC): inicio da medicao do ciclo =====
+  unsigned long t0 = micros(); //marcador de inicio de ciclo
+  unsigned long periodUs = t0 - statsLastLoopStartUs; //distancia entre inicios de ciclo consecutivos
+  unsigned long bodyUs = 0;   //tempo de trabalho do corpo do loop (medido antes do loopRate)
+  statsLastLoopStartUs = t0;
+  if (statsPrimed) { //o primeiro periodUs (logo apos o setup) e descartado
+    statsPerSum += periodUs;
+    if (periodUs > statsPerMax) statsPerMax = periodUs;
+    if (periodUs < statsPerMin) statsPerMin = periodUs;
+  }
+  statsPrimed = true;
+
+  //Keep track of what time it is and how much time has elapsed since the last loop
   prev_time = current_time;      
   current_time = micros();      
   dt = (current_time - prev_time)/1000000.0;
 
-  loopBlink(); //indicate we are in main loop with short blink every 1.5 seconds
+  loopBlink(); //Indicate we are in main loop with short blink every 1.5 seconds
 
   //Print data at 100hz (uncomment one at a time for troubleshooting) - SELECT ONE:
-  //printRadioData();     //radio pwm values (expected: 1000 to 2000)
-  //printDesiredState();  //prints desired vehicle state commanded in either degrees or deg/sec (expected: +/- maxAXIS for roll, pitch, yaw; 0 to 1 for throttle)
-  //printGyroData();      //prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
-  //printAccelData();     //prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
-  //printMagData();       //prints filtered magnetometer data direct from IMU (expected: ~ -300 to 300)
-  //printRollPitchYaw();  //prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
-  //printPIDoutput();     //prints computed stabilized PID variables from controller and desired setpoint (expected: ~ -1 to 1)
-  //printMotorCommands(); //prints the values being written to the motors (expected: 120 to 250)
-  //printServoCommands(); //prints the values being written to the servos (expected: 0 to 180)
-  //printLoopRate();      //prints the time between loops in microseconds (expected: microseconds between loop iterations)
+  //printRadioData();     //Prints radio pwm values (expected: 1000 to 2000)
+  //printDesiredState();  //Prints desired vehicle state commanded in either degrees or deg/sec (expected: +/- maxAXIS for roll, pitch, yaw; 0 to 1 for throttle)
+  //printGyroData();      //Prints filtered gyro data direct from IMU (expected: ~ -250 to 250, 0 at rest)
+  //printAccelData();     //Prints filtered accelerometer data direct from IMU (expected: ~ -2 to 2; x,y 0 when level, z 1 when level)
+  //printMagData();       //Prints filtered magnetometer data direct from IMU (expected: ~ -300 to 300)
+  //printRollPitchYaw();  //Prints roll, pitch, and yaw angles in degrees from Madgwick filter (expected: degrees, 0 when level)
+  //printPIDoutput();     //Prints computed stabilized PID variables from controller and desired setpoint (expected: ~ -1 to 1)
+  //printMotorCommands(); //Prints the values being written to the motors (expected: 120 to 250)
+  //printServoCommands(); //Prints the values being written to the servos (expected: 0 to 180)
+  //printLoopRate();      //Prints the time between loops in microseconds (expected: microseconds between loop iterations)
+
+  // Get arming status
+  armedStatus(); //Check if the throttle cut is off and throttle is low.
 
   //Get vehicle state
-  getIMUdata(); //pulls raw gyro, accelerometer, and magnetometer data from IMU and LP filters to remove noise
-  Madgwick(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, MagY, -MagX, MagZ, dt); //updates roll_IMU, pitch_IMU, and yaw_IMU (degrees)
+  getIMUdata(); //Pulls raw gyro, accelerometer, and magnetometer data from IMU and LP filters to remove noise
+  Madgwick(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, MagY, -MagX, MagZ, dt); //Updates roll_IMU, pitch_IMU, and yaw_IMU angle estimates (degrees)
 
   //Compute desired state
-  getDesState(); //convert raw commands to normalized values based on saturated control limits
+  getDesState(); //Convert raw commands to normalized values based on saturated control limits
   
   //PID Controller - SELECT ONE:
-  controlANGLE(); //stabilize on angle setpoint
-  //controlANGLE2(); //stabilize on angle setpoint using cascaded method 
-  //controlRATE(); //stabilize on rate setpoint
+  controlANGLE(); //Stabilize on angle setpoint
+  //controlANGLE2(); //Stabilize on angle setpoint using cascaded method. Rate controller must be tuned well first!
+  //controlRATE(); //Stabilize on rate setpoint
 
   //Actuator mixing and scaling to PWM values
-  controlMixer(); //mixes PID outputs to scaled actuator commands -- custom mixing assignments done here
-  scaleCommands(); //scales motor commands to 125 to 250 range (oneshot125 protocol) and servo PWM commands to 0 to 180 (for servo library)
+  controlMixer(); //Mixes PID outputs to scaled actuator commands -- custom mixing assignments done here
+  scaleCommands(); //Scales motor commands to 125 to 250 range (oneshot125 protocol) and servo PWM commands to 0 to 180 (for servo library)
 
   //Throttle cut check
-  throttleCut(); //directly sets motor commands to low based on state of ch5
+  throttleCut(); //Directly sets motor commands to low based on state of ch5
 
   //Command actuators
-  commandMotors(); //sends command pulses to each motor pin using OneShot125 protocol
-  servo1.write(s1_command_PWM); 
+  commandMotors(); //Sends command pulses to each motor pin using OneShot125 protocol
+  servo1.write(s1_command_PWM); //Writes PWM value to servo object
   servo2.write(s2_command_PWM);
   servo3.write(s3_command_PWM);
   servo4.write(s4_command_PWM);
   servo5.write(s5_command_PWM);
   servo6.write(s6_command_PWM);
   servo7.write(s7_command_PWM);
-    
+
+  //===== PORT ESP32 (TCC): log rapido opcional (tecla 'l') para GRAFICOS de resposta =====
+  //~100 Hz (1 em 10 ciclos; loop ~1067 Hz). Mesmos campos do CSV do firmware de referencia:
+  //LOG,<ms>,roll,pitch,gx,gy,gz,pidRoll,pitch_PID,pidYaw,m1,m2,m3,m4 (PWM 1000-2000).
+  //NOTA: nao usar durante a janela de medicao de JITTER (o printf soma ~30-50 us ao corpo
+  //em 1 de cada 10 ciclos); para metricas, rode com o log DESLIGADO.
+  if (logFast) {
+    if (++logFastN >= 10) {
+      logFastN = 0;
+      Serial.printf("LOG,%lu,%.2f,%.2f,%.1f,%.1f,%.1f,%.3f,%.3f,%.3f,%d,%d,%d,%d\n",
+                    (unsigned long)(micros()/1000),
+                    (double)roll_IMU, (double)pitch_IMU,
+                    (double)GyroX, (double)GyroY, (double)GyroZ,
+                    (double)roll_PID, (double)pitch_PID, (double)yaw_PID,
+                    (int)m1_command_PWM, (int)m2_command_PWM,
+                    (int)m3_command_PWM, (int)m4_command_PWM);
+    }
+  }
+
   //Get vehicle commands for next loop iteration
-  getCommands(); //pulls current available radio commands
-  failSafe(); //prevent failures in event of bad receiver connection, defaults to failsafe values assigned in setup
+  getCommands(); //Pulls current available radio commands
+  failSafe(); //Prevent failures in event of bad receiver connection, defaults to failsafe values assigned in setup
+
+  //===== PORT ESP32 (TCC): comando serial substitui o receptor =====
+  //Aplicado DEPOIS de getCommands()+failSafe() e ANTES de armedStatus()/getDesState() do
+  //proximo ciclo (mesma logica do upstream, que alimenta o proximo loop no fim deste).
+  //failSafe() nao tem mais efeito sobre os canais usados: este bloco REESCREVE ch1..ch5
+  //a cada ciclo, entao valores "garbage" do RX desativado sao sempre sobrescritos.
+  pollSerialCommands(); //processa teclas 'a','d','+','-','p' pendentes
+  channel_1_pwm = serThrottle;      //ch1 = throttle (armedStatus exige <1050 para armar)
+  channel_2_pwm = 1500;             //ch2 = roll centrado
+  channel_3_pwm = 1500;             //ch3 = pitch centrado
+  channel_4_pwm = 1500;             //ch4 = yaw centrado
+  channel_5_pwm = serCut ? 2000 : 1000; //ch5 = gear/corte: >1500 corta e desarma; 1000 = liberado
+
+  //===== PORT ESP32 (TCC): fim da medicao do ciclo + janela de 1 s =====
+  bodyUs = micros() - t0; //trabalho do ciclo ANTES da espera do loopRate
+  statsBodySum += bodyUs;
+  if (bodyUs > statsBodyMax) statsBodyMax = bodyUs;
+  if (bodyUs >= ESTOURO_LIMITE_US) statsEstouros++; //estouro = bodyUs >= 4000 us (trava, igual referencia)
+  statsCiclos++;
+  printStatsIfDue(); //imprime e zera a janela STATS uma vez por segundo
 
   //Regulate loop rate
-  loopRate(2000); //do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
+  loopRate(2000); //Do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
 }
 
 
@@ -450,21 +590,112 @@ void loop() {
 //                                                      FUNCTIONS                                                         //                           
 //========================================================================================================================//
 
+
+
+void controlMixer() {
+  //DESCRIPTION: Mixes scaled commands from PID controller to actuator outputs based on vehicle configuration
+  /*
+   * Takes roll_PID, pitch_PID, and yaw_PID computed from the PID controller and appropriately mixes them for the desired
+   * vehicle configuration. For example on a quadcopter, the left two motors should have +roll_PID while the right two motors
+   * should have -roll_PID. Front two should have -pitch_PID and the back two should have +pitch_PID etc... every motor has
+   * normalized (0 to 1) thro_des command for throttle control. Can also apply direct unstabilized commands from the transmitter with 
+   * roll_passthru, pitch_passthru, and yaw_passthu. mX_command_scaled and sX_command scaled variables are used in scaleCommands() 
+   * in preparation to be sent to the motor ESCs and servos.
+   * 
+   *Relevant variables:
+   *thro_des - direct thottle control
+   *roll_PID, pitch_PID, yaw_PID - stabilized axis variables
+   *roll_passthru, pitch_passthru, yaw_passthru - direct unstabilized command passthrough
+   *channel_6_pwm - free auxillary channel, can be used to toggle things with an 'if' statement
+   */
+   
+  //Quad mixing - EXAMPLE
+  m1_command_scaled = thro_des - pitch_PID + roll_PID + yaw_PID; //Front Left
+  m2_command_scaled = thro_des - pitch_PID - roll_PID - yaw_PID; //Front Right
+  m3_command_scaled = thro_des + pitch_PID - roll_PID + yaw_PID; //Back Right
+  m4_command_scaled = thro_des + pitch_PID + roll_PID - yaw_PID; //Back Left
+  m5_command_scaled = 0;
+  m6_command_scaled = 0;
+
+  //0.5 is centered servo, 0.0 is zero throttle if connecting to ESC for conventional PWM, 1.0 is max throttle
+  s1_command_scaled = 0;
+  s2_command_scaled = 0;
+  s3_command_scaled = 0;
+  s4_command_scaled = 0;
+  s5_command_scaled = 0;
+  s6_command_scaled = 0;
+  s7_command_scaled = 0;
+ 
+}
+
+void armedStatus() {
+  //DESCRIPTION: Check if the throttle cut is off and the throttle input is low to prepare for flight.
+  if ((channel_5_pwm < 1500) && (channel_1_pwm < 1050)) {
+    armedFly = true;
+  }
+}
+
 void IMUinit() {
   //DESCRIPTION: Initialize IMU
   /*
-   * Don't worry about how this works
+   * Don't worry about how this works.
    */
   #if defined USE_MPU6050_I2C
     Wire.begin();
-    Wire.setClock(1000000); //Note this is 2.5 times the spec sheet 400 kHz max...
+    //PORT ESP32: 400 kHz em vez dos 1000 kHz do upstream. O upstream usa 1 MHz (2.5x o
+    //maximo de 400 kHz da especificacao do MPU6050) porque no Teensy a fiação e curta;
+    //aqui a fiação e em protoboard/jumper, entao 400 kHz (maximo do datasheet) e seguro.
+    //Se houver problema de timing/I2C, e documentavel voltar para 1000000.
+    Wire.setClock(400000);
     
     mpu6050.initialize();
     
-    if (mpu6050.testConnection() == false) {
-      Serial.println("MPU6050 initialization unsuccessful");
-      Serial.println("Check MPU6050 wiring or try cycling power");
-      while(1) {}
+    //PORT ESP32 (TCC): a 1a leitura logo apos ligar/reset costuma falhar
+    //(mesmo fenomeno documentado no firmware de referencia: "o sensor/barramento
+    //esta subindo"). Em vez de abortar na 1a tentativa com while(1), tenta ate
+    //20x (50 ms entre elas = ~1 s) - mesma politica do conectarIMU(20) da
+    //referencia. Se todas falharem, aih SIM imprime diagnostico de barramento
+    //antes de travar (para nao ficar "adivinhando" a causa do falha).
+    bool conn = false;
+    for (int t = 0; t < 20 && !conn; t++) {
+      conn = (mpu6050.testConnection() == true);
+      if (!conn) {
+        mpu6050.initialize();          // reacorda/reconfigura e tenta de novo
+        delay(50);
+      }
+    }
+
+    if (!conn) {
+      //--- DIAGNOSTICO DE BARRAMENTO (TCC) ---
+      int sdaLvl = digitalRead(21);    //niveis dos fios (repouso I2C = 1/1)
+      int sclLvl = digitalRead(22);
+      Wire.beginTransmission(0x68);    //prova de endereco: 0 = chip ACK
+      int err = Wire.endTransmission();
+      uint8_t who = 0;
+      Wire.beginTransmission(0x68);
+      Wire.write(0x75);                //WHO_AM_I cru
+      uint8_t e2 = Wire.endTransmission(false);
+      uint8_t n = Wire.requestFrom((uint8_t)0x68, (uint8_t)1);
+      if (n == 1 && Wire.available()) who = Wire.read();
+      Serial.print("DIAG I2C: ack="); Serial.print(err == 0 ? "SIM" : "NAO");
+      Serial.print(" errTrans="); Serial.print(err);
+      Serial.print(" sda21="); Serial.print(sdaLvl);
+      Serial.print(" scl22="); Serial.print(sclLvl);
+      Serial.print(" who=0x"); Serial.print(who, HEX);
+      Serial.print(" regErr="); Serial.print(e2);
+      Serial.print(" nLidos="); Serial.println(n);
+
+      if (err == 0 && who != 0) {
+        //o chip RESPONDE mas o ID nao bateu com 0x34 (clona?) - segue com
+        //leitura direta do registrador (mesma logica do firmware de referencia)
+        Serial.println("AVISO: chip respondeu mas testConnection()!=0x34 - seguindo mesmo assim");
+      } else {
+        Serial.println("MPU6050 initialization unsuccessful");
+        Serial.println("Check MPU6050 wiring or try cycling power");
+        while(1) {}
+      }
+    } else {
+      Serial.println("MPU6050 OK (testConnection apos retry)");
     }
 
     //From the reset state all registers should be 0x00, so we should be at
@@ -530,6 +761,16 @@ void getIMUdata() {
   AccY_prev = AccY;
   AccZ_prev = AccZ;
 
+  //===== PORT ESP32 (TCC): medicao de vibracao, IMEDIATAMENTE apos escala/filtro da IMU =====
+  //Calculada com as mesmas aceleracoes em g que alimentam o Madgwick (ja escaladas e
+  //com o LP filtro B_accel aplicado). dev = | |a| - 1g |; vibRms = EWMA (alpha=0.01);
+  //vibPeak = maximo da janela de 1 s (zerado em printStatsIfDue()).
+  {
+    float dev = fabs(sqrtf(AccX*AccX + AccY*AccY + AccZ*AccZ) - 1.0f);
+    vibRms += (dev - vibRms)*0.01f;
+    if (dev > vibPeak) vibPeak = dev;
+  }
+
   //Gyro
   GyroX = GyX / GYRO_SCALE_FACTOR; //deg/sec
   GyroY = GyY / GYRO_SCALE_FACTOR;
@@ -571,6 +812,12 @@ void calculate_IMU_error() {
    * measurement. 
    */
   int16_t AcX,AcY,AcZ,GyX,GyY,GyZ,MgX,MgY,MgZ;
+  AccErrorX = 0.0;
+  AccErrorY = 0.0;
+  AccErrorZ = 0.0;
+  GyroErrorX = 0.0;
+  GyroErrorY= 0.0;
+  GyroErrorZ = 0.0;
   
   //Read IMU values 12000 times
   int c = 0;
@@ -604,6 +851,28 @@ void calculate_IMU_error() {
   GyroErrorX = GyroErrorX / c;
   GyroErrorY = GyroErrorY / c;
   GyroErrorZ = GyroErrorZ / c;
+
+  Serial.print("float AccErrorX = ");
+  Serial.print(AccErrorX);
+  Serial.println(";");
+  Serial.print("float AccErrorY = ");
+  Serial.print(AccErrorY);
+  Serial.println(";");
+  Serial.print("float AccErrorZ = ");
+  Serial.print(AccErrorZ);
+  Serial.println(";");
+  
+  Serial.print("float GyroErrorX = ");
+  Serial.print(GyroErrorX);
+  Serial.println(";");
+  Serial.print("float GyroErrorY = ");
+  Serial.print(GyroErrorY);
+  Serial.println(";");
+  Serial.print("float GyroErrorZ = ");
+  Serial.print(GyroErrorZ);
+  Serial.println(";");
+
+  Serial.println("Paste these values in user specified variables section and comment out calculate_IMU_error() in void setup.");
 }
 
 void calibrateAttitude() {
@@ -638,7 +907,6 @@ void Madgwick(float gx, float gy, float gz, float ax, float ay, float az, float 
   float qDot1, qDot2, qDot3, qDot4;
   float hx, hy;
   float _2q0mx, _2q0my, _2q0mz, _2q1mx, _2bx, _2bz, _4bx, _4bz, _2q0, _2q1, _2q2, _2q3, _2q0q2, _2q2q3, q0q0, q0q1, q0q2, q0q3, q1q1, q1q2, q1q3, q2q2, q2q3, q3q3;
-  float mholder;
 
   //use 6DOF algorithm if MPU6050 is being used
   #if defined USE_MPU6050_I2C 
@@ -732,7 +1000,7 @@ void Madgwick(float gx, float gy, float gz, float ax, float ay, float az, float 
   q2 += qDot3 * invSampleFreq;
   q3 += qDot4 * invSampleFreq;
 
-  //Normalise quaternion
+  //Normalize quaternion
   recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
   q0 *= recipNorm;
   q1 *= recipNorm;
@@ -741,7 +1009,7 @@ void Madgwick(float gx, float gy, float gz, float ax, float ay, float az, float 
   
   //compute angles - NWU
   roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-  pitch_IMU = -asin(-2.0f * (q1*q3 - q0*q2))*57.29577951; //degrees
+  pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999,0.999999))*57.29577951; //degrees
   yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
 }
 
@@ -821,9 +1089,9 @@ void Madgwick6DOF(float gx, float gy, float gz, float ax, float ay, float az, fl
   q2 *= recipNorm;
   q3 *= recipNorm;
 
-  //compute angles
+  //Compute angles
   roll_IMU = atan2(q0*q1 + q2*q3, 0.5f - q1*q1 - q2*q2)*57.29577951; //degrees
-  pitch_IMU = -asin(-2.0f * (q1*q3 - q0*q2))*57.29577951; //degrees
+  pitch_IMU = -asin(constrain(-2.0f * (q1*q3 - q0*q2),-0.999999,0.999999))*57.29577951; //degrees
   yaw_IMU = -atan2(q1*q2 + q0*q3, 0.5f - q2*q2 - q3*q3)*57.29577951; //degrees
 }
 
@@ -836,19 +1104,22 @@ void getDesState() {
    * (rate mode). yaw_des is scaled to be within max yaw in degrees/sec. Also creates roll_passthru, pitch_passthru, and
    * yaw_passthru variables, to be used in commanding motors/servos with direct unstabilized commands in controlMixer().
    */
-  thro_des = (channel_1_pwm - 1000.0)/1000.0; //between 0 and 1
-  roll_des = (channel_2_pwm - 1500.0)/500.0; //between -1 and 1
-  pitch_des = (channel_3_pwm - 1500.0)/500.0; //between -1 and 1
-  yaw_des = (channel_4_pwm - 1500.0)/500.0; //between -1 and 1
+  thro_des = (channel_1_pwm - 1000.0)/1000.0; //Between 0 and 1
+  roll_des = (channel_2_pwm - 1500.0)/500.0; //Between -1 and 1
+  pitch_des = (channel_3_pwm - 1500.0)/500.0; //Between -1 and 1
+  yaw_des = (channel_4_pwm - 1500.0)/500.0; //Between -1 and 1
+  roll_passthru = roll_des/2.0; //Between -0.5 and 0.5
+  pitch_passthru = pitch_des/2.0; //Between -0.5 and 0.5
+  yaw_passthru = yaw_des/2.0; //Between -0.5 and 0.5
+  
   //Constrain within normalized bounds
-  thro_des = constrain(thro_des, 0.0, 1.0); //between 0 and 1
-  roll_des = constrain(roll_des, -1.0, 1.0)*maxRoll; //between -maxRoll and +maxRoll
-  pitch_des = constrain(pitch_des, -1.0, 1.0)*maxPitch; //between -maxPitch and +maxPitch
-  yaw_des = constrain(yaw_des, -1.0, 1.0)*maxYaw; //between -maxYaw and +maxYaw
-
-  roll_passthru = roll_des/(2*maxRoll);
-  pitch_passthru = pitch_des/(2*maxPitch);
-  yaw_passthru = yaw_des/(2*maxYaw);
+  thro_des = constrain(thro_des, 0.0, 1.0); //Between 0 and 1
+  roll_des = constrain(roll_des, -1.0, 1.0)*maxRoll; //Between -maxRoll and +maxRoll
+  pitch_des = constrain(pitch_des, -1.0, 1.0)*maxPitch; //Between -maxPitch and +maxPitch
+  yaw_des = constrain(yaw_des, -1.0, 1.0)*maxYaw; //Between -maxYaw and +maxYaw
+  roll_passthru = constrain(roll_passthru, -0.5, 0.5);
+  pitch_passthru = constrain(pitch_passthru, -0.5, 0.5);
+  yaw_passthru = constrain(yaw_passthru, -0.5, 0.5);
 }
 
 void controlANGLE() {
@@ -867,32 +1138,32 @@ void controlANGLE() {
   //Roll
   error_roll = roll_des - roll_IMU;
   integral_roll = integral_roll_prev + error_roll*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_roll = 0;
   }
-  integral_roll = constrain(integral_roll, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_roll = constrain(integral_roll, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_roll = GyroX;
-  roll_PID = 0.01*(Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll - Kd_roll_angle*derivative_roll); //scaled by .01 to bring within -1 to 1 range
+  roll_PID = 0.01*(Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll - Kd_roll_angle*derivative_roll); //Scaled by .01 to bring within -1 to 1 range
 
   //Pitch
   error_pitch = pitch_des - pitch_IMU;
   integral_pitch = integral_pitch_prev + error_pitch*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_pitch = 0;
   }
-  integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_pitch = GyroY;
-  pitch_PID = .01*(Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch - Kd_pitch_angle*derivative_pitch); //scaled by .01 to bring within -1 to 1 range
+  pitch_PID = .01*(Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch - Kd_pitch_angle*derivative_pitch); //Scaled by .01 to bring within -1 to 1 range
 
   //Yaw, stablize on rate from GyroZ
   error_yaw = yaw_des - GyroZ;
   integral_yaw = integral_yaw_prev + error_yaw*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_yaw = 0;
   }
-  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_yaw = (error_yaw - error_yaw_prev)/dt; 
-  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //scaled by .01 to bring within -1 to 1 range
+  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //Scaled by .01 to bring within -1 to 1 range
 
   //Update roll variables
   integral_roll_prev = integral_roll;
@@ -914,22 +1185,22 @@ void controlANGLE2() {
   //Roll
   error_roll = roll_des - roll_IMU;
   integral_roll_ol = integral_roll_prev_ol + error_roll*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_roll_ol = 0;
   }
-  integral_roll_ol = constrain(integral_roll_ol, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_roll_ol = constrain(integral_roll_ol, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_roll = (roll_IMU - roll_IMU_prev)/dt; 
-  roll_des_ol = Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll_ol - Kd_roll_angle*derivative_roll;
+  roll_des_ol = Kp_roll_angle*error_roll + Ki_roll_angle*integral_roll_ol;// - Kd_roll_angle*derivative_roll;
 
   //Pitch
   error_pitch = pitch_des - pitch_IMU;
   integral_pitch_ol = integral_pitch_prev_ol + error_pitch*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_pitch_ol = 0;
   }
   integral_pitch_ol = constrain(integral_pitch_ol, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
   derivative_pitch = (pitch_IMU - pitch_IMU_prev)/dt;
-  pitch_des_ol = Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch_ol - Kd_pitch_angle*derivative_pitch;
+  pitch_des_ol = Kp_pitch_angle*error_pitch + Ki_pitch_angle*integral_pitch_ol;// - Kd_pitch_angle*derivative_pitch;
 
   //Apply loop gain, constrain, and LP filter for artificial damping
   float Kl = 30.0;
@@ -944,32 +1215,32 @@ void controlANGLE2() {
   //Roll
   error_roll = roll_des_ol - GyroX;
   integral_roll_il = integral_roll_prev_il + error_roll*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_roll_il = 0;
   }
-  integral_roll_il = constrain(integral_roll_il, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_roll_il = constrain(integral_roll_il, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_roll = (error_roll - error_roll_prev)/dt; 
-  roll_PID = .01*(Kp_roll_rate*error_roll + Ki_roll_rate*integral_roll_il + Kd_roll_rate*derivative_roll); //scaled by .01 to bring within -1 to 1 range
+  roll_PID = .01*(Kp_roll_rate*error_roll + Ki_roll_rate*integral_roll_il + Kd_roll_rate*derivative_roll); //Scaled by .01 to bring within -1 to 1 range
 
   //Pitch
   error_pitch = pitch_des_ol - GyroY;
   integral_pitch_il = integral_pitch_prev_il + error_pitch*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_pitch_il = 0;
   }
-  integral_pitch_il = constrain(integral_pitch_il, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_pitch_il = constrain(integral_pitch_il, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_pitch = (error_pitch - error_pitch_prev)/dt; 
-  pitch_PID = .01*(Kp_pitch_rate*error_pitch + Ki_pitch_rate*integral_pitch_il + Kd_pitch_rate*derivative_pitch); //scaled by .01 to bring within -1 to 1 range
+  pitch_PID = .01*(Kp_pitch_rate*error_pitch + Ki_pitch_rate*integral_pitch_il + Kd_pitch_rate*derivative_pitch); //Scaled by .01 to bring within -1 to 1 range
   
   //Yaw
   error_yaw = yaw_des - GyroZ;
   integral_yaw = integral_yaw_prev + error_yaw*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_yaw = 0;
   }
-  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_yaw = (error_yaw - error_yaw_prev)/dt; 
-  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //scaled by .01 to bring within -1 to 1 range
+  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //Scaled by .01 to bring within -1 to 1 range
   
   //Update roll variables
   integral_roll_prev_ol = integral_roll_ol;
@@ -997,32 +1268,32 @@ void controlRATE() {
   //Roll
   error_roll = roll_des - GyroX;
   integral_roll = integral_roll_prev + error_roll*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_roll = 0;
   }
-  integral_roll = constrain(integral_roll, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_roll = constrain(integral_roll, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_roll = (error_roll - error_roll_prev)/dt; 
-  roll_PID = .01*(Kp_roll_rate*error_roll + Ki_roll_rate*integral_roll + Kd_roll_rate*derivative_roll); //scaled by .01 to bring within -1 to 1 range
+  roll_PID = .01*(Kp_roll_rate*error_roll + Ki_roll_rate*integral_roll + Kd_roll_rate*derivative_roll); //Scaled by .01 to bring within -1 to 1 range
 
   //Pitch
   error_pitch = pitch_des - GyroY;
   integral_pitch = integral_pitch_prev + error_pitch*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_pitch = 0;
   }
-  integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_pitch = constrain(integral_pitch, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_pitch = (error_pitch - error_pitch_prev)/dt; 
-  pitch_PID = .01*(Kp_pitch_rate*error_pitch + Ki_pitch_rate*integral_pitch + Kd_pitch_rate*derivative_pitch); //scaled by .01 to bring within -1 to 1 range
+  pitch_PID = .01*(Kp_pitch_rate*error_pitch + Ki_pitch_rate*integral_pitch + Kd_pitch_rate*derivative_pitch); //Scaled by .01 to bring within -1 to 1 range
 
   //Yaw, stablize on rate from GyroZ
   error_yaw = yaw_des - GyroZ;
   integral_yaw = integral_yaw_prev + error_yaw*dt;
-  if (channel_1_pwm < 1060) {   //don't let integrator build if throttle is too low
+  if (channel_1_pwm < 1060) {   //Don't let integrator build if throttle is too low
     integral_yaw = 0;
   }
-  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //saturate integrator to prevent unsafe buildup
+  integral_yaw = constrain(integral_yaw, -i_limit, i_limit); //Saturate integrator to prevent unsafe buildup
   derivative_yaw = (error_yaw - error_yaw_prev)/dt; 
-  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //scaled by .01 to bring within -1 to 1 range
+  yaw_PID = .01*(Kp_yaw*error_yaw + Ki_yaw*integral_yaw + Kd_yaw*derivative_yaw); //Scaled by .01 to bring within -1 to 1 range
 
   //Update roll variables
   error_roll_prev = error_roll;
@@ -1037,45 +1308,6 @@ void controlRATE() {
   integral_yaw_prev = integral_yaw;
 }
 
-void controlMixer() {
-  //DESCRIPTION: Mixes scaled commands from PID controller to actuator outputs based on vehicle configuration
-  /*
-   * Takes roll_PID, pitch_PID, and yaw_PID computed from the PID controller and appropriately mixes them for the desired
-   * vehicle configuration. For example on a quadcopter, the left two motors should have +roll_PID while the right two motors
-   * should have -roll_PID. Front two should have -pitch_PID and the back two should have +pitch_PID etc... every motor has
-   * normalized (0 to 1) thro_des command for throttle control. Can also apply direct unstabilized commands from the transmitter with 
-   * roll_passthru, pitch_passthru, and yaw_passthu. mX_command_scaled and sX_command scaled variables are used in scaleCommands() 
-   * in preparation to be sent to the motor ESCs and servos.
-   */
-  //Quad mixing
-  //m1 = front left, m2 = front right, m3 = back right, m4 = back left
-  m1_command_scaled = thro_des - pitch_PID + roll_PID + yaw_PID;
-  m2_command_scaled = thro_des - pitch_PID - roll_PID - yaw_PID;
-  m3_command_scaled = thro_des + pitch_PID - roll_PID + yaw_PID;
-  m4_command_scaled = thro_des + pitch_PID + roll_PID - yaw_PID;
-  m5_command_scaled = 0;
-  m6_command_scaled = 0;
-
-  //0.5 is centered servo, 0 is zero throttle if connecting to ESC for conventional PWM, 1 is max throttle
-  s1_command_scaled = 0;
-  s2_command_scaled = 0;
-  s3_command_scaled = 0;
-  s4_command_scaled = 0;
-  s5_command_scaled = 0;
-  s6_command_scaled = 0;
-  s7_command_scaled = 0;
-
-  //Example use of the linear fader for float type variables. Linearly interpolate between minimum and maximum values for Kp_pitch_rate variable based on state of channel 6:
-  /*
-  if (channel_6_pwm > 1500){ //go to max specified value in 5.5 seconds
-    Kp_pitch_rate = floatFaderLinear(Kp_pitch_rate, 0.1, 0.3, 5.5, 1, 2000); //parameter, minimum value, maximum value, fadeTime (seconds), state (0 min or 1 max), loop frequency
-  }
-  if (channel_6_pwm < 1500) { //go to min specified value in 2.5 seconds
-    Kp_pitch_rate = floatFaderLinear(Kp_pitch_rate, 0.1, 0.3, 2.5, 0, 2000); //parameter, minimum value, maximum value, fadeTime, state (0 min or 1 max), loop frequency
-  }
-  */
-}
-
 void scaleCommands() {
   //DESCRIPTION: Scale normalized actuator commands to values for ESC/Servo protocol
   /*
@@ -1084,20 +1316,23 @@ void scaleCommands() {
    * mX_command_PWM are updated here which are used to command the motors in commandMotors(). sX_command_PWM are updated 
    * which are used to command the servos.
    */
-  //Scaled to 125us - 250us for oneshot125 protocol
-  m1_command_PWM = m1_command_scaled*125 + 125;
-  m2_command_PWM = m2_command_scaled*125 + 125;
-  m3_command_PWM = m3_command_scaled*125 + 125;
-  m4_command_PWM = m4_command_scaled*125 + 125;
-  m5_command_PWM = m5_command_scaled*125 + 125;
-  m6_command_PWM = m6_command_scaled*125 + 125;
-  //Constrain commands to motors within oneshot125 bounds
-  m1_command_PWM = constrain(m1_command_PWM, 125, 250);
-  m2_command_PWM = constrain(m2_command_PWM, 125, 250);
-  m3_command_PWM = constrain(m3_command_PWM, 125, 250);
-  m4_command_PWM = constrain(m4_command_PWM, 125, 250);
-  m5_command_PWM = constrain(m5_command_PWM, 125, 250);
-  m6_command_PWM = constrain(m6_command_PWM, 125, 250);
+  //ADAPTADO (TCC): PWM de servo 1000-2000us para os ESCs SimonK HW-30A do
+  //usuario - mesma escala, faixa e frequencia (400 Hz) do firmware de
+  //referencia, para a comparacao ser justa.
+  //(Original OneShot125: scaled*125 + 125, limitado a 125..250us)
+  m1_command_PWM = m1_command_scaled*1000 + 1000;
+  m2_command_PWM = m2_command_scaled*1000 + 1000;
+  m3_command_PWM = m3_command_scaled*1000 + 1000;
+  m4_command_PWM = m4_command_scaled*1000 + 1000;
+  m5_command_PWM = m5_command_scaled*1000 + 1000;
+  m6_command_PWM = m6_command_scaled*1000 + 1000;
+  //Constrain commands to motors within standard PWM ESC bounds
+  m1_command_PWM = constrain(m1_command_PWM, 1000, 2000);
+  m2_command_PWM = constrain(m2_command_PWM, 1000, 2000);
+  m3_command_PWM = constrain(m3_command_PWM, 1000, 2000);
+  m4_command_PWM = constrain(m4_command_PWM, 1000, 2000);
+  m5_command_PWM = constrain(m5_command_PWM, 1000, 2000);
+  m6_command_PWM = constrain(m6_command_PWM, 1000, 2000);
 
   //Scaled to 0-180 for servo library
   s1_command_PWM = s1_command_scaled*180;
@@ -1148,10 +1383,26 @@ void getCommands() {
       channel_5_pwm = sbusChannels[4] * scale + bias;
       channel_6_pwm = sbusChannels[5] * scale + bias; 
     }
+
+  #elif defined USE_DSM_RX
+    if (DSM.timedOut(micros())) {
+        //Serial.println("*** DSM RX TIMED OUT ***");
+    }
+    else if (DSM.gotNewFrame()) {
+        uint16_t values[num_DSM_channels];
+        DSM.getChannelValues(values, num_DSM_channels);
+
+        channel_1_pwm = values[0];
+        channel_2_pwm = values[1];
+        channel_3_pwm = values[2];
+        channel_4_pwm = values[3];
+        channel_5_pwm = values[4];
+        channel_6_pwm = values[5];
+    }
   #endif
   
   //Low-pass the critical commands and update previous values
-  float b = 0.2; //lower=slower, higher=noiser
+  float b = 0.7; //Lower=slower, higher=noiser
   channel_1_pwm = (1.0 - b)*channel_1_pwm_prev + b*channel_1_pwm;
   channel_2_pwm = (1.0 - b)*channel_2_pwm_prev + b*channel_2_pwm;
   channel_3_pwm = (1.0 - b)*channel_3_pwm_prev + b*channel_3_pwm;
@@ -1200,63 +1451,86 @@ void failSafe() {
 }
 
 void commandMotors() {
-  //DESCRIPTION: Send pulses to motor pins, oneshot125 protocol
+  //DESCRIPTION: Send PWM pulses to motor pins (standard servo PWM)
   /*
-   * My crude implimentation of OneShot125 protocol which sends 125 - 250us pulses to the ESCs (mXPin). The pulselengths being
-   * sent are mX_command_PWM, computed in scaleCommands(). This may be replaced by something more efficient in the future.
+   * ADAPTADO (TCC): os ESCs SimonK HW-30A do usuario nao interpretam
+   * OneShot125 (o bit-bang original travava ~250us do ciclo por laco).
+   * Agora usa ESP32Servo nos MESMOS pinos (m1-m4) e MESMA frequencia
+   * (400 Hz, 1000-2000 us) do firmware de referencia do TCC. Os valores
+   * mX_command_PWM vao em microssegundos, calculados em scaleCommands().
+   * (Original: bit-bang de pulsos 125-250us - restaure a partir da pasta
+   * Downloads\dRehmFlight se precisar do protocolo OneShot125.)
    */
-  int wentLow = 0;
-  int pulseStart, timer;
-  int flagM1 = 0;
-  int flagM2 = 0;
-  int flagM3 = 0;
-  int flagM4 = 0;
-  int flagM5 = 0;
-  int flagM6 = 0;
-  
-  //Write all motor pins high
-  digitalWrite(m1Pin, HIGH);
-  digitalWrite(m2Pin, HIGH);
-  digitalWrite(m3Pin, HIGH);
-  digitalWrite(m4Pin, HIGH);
-  digitalWrite(m5Pin, HIGH);
-  digitalWrite(m6Pin, HIGH);
-  pulseStart = micros();
+  esc1.writeMicroseconds(m1_command_PWM);
+  esc2.writeMicroseconds(m2_command_PWM);
+  esc3.writeMicroseconds(m3_command_PWM);
+  esc4.writeMicroseconds(m4_command_PWM);
+}
 
-  //Write each motor pin low as correct pulse length is reached
-  while (wentLow < 6 ) { //keep going until final (6th) pulse is finished, then done
-    timer = micros();
-    if ((m1_command_PWM <= timer - pulseStart) && (flagM1==0)) {
-      digitalWrite(m1Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM1 = 1;
-    }
-    if ((m2_command_PWM <= timer - pulseStart) && (flagM2==0)) {
-      digitalWrite(m2Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM2 = 1;
-    }
-    if ((m3_command_PWM <= timer - pulseStart) && (flagM3==0)) {
-      digitalWrite(m3Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM3 = 1;
-    }
-    if ((m4_command_PWM <= timer - pulseStart) && (flagM4==0)) {
-      digitalWrite(m4Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM4 = 1;
-    } 
-    if ((m5_command_PWM <= timer - pulseStart) && (flagM5==0)) {
-      digitalWrite(m5Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM5 = 1;
-    } 
-    if ((m6_command_PWM <= timer - pulseStart) && (flagM6==0)) {
-      digitalWrite(m6Pin, LOW);
-      wentLow = wentLow + 1;
-      flagM6 = 1;
-    } 
+void armMotors() {
+  //DESCRIPTION: Sends many command pulses to the motors, to be used to arm motors in the void setup()
+  /*  
+   *  Loops over the commandMotors() function 50 times with a delay in between, simulating how the commandMotors()
+   *  function is used in the main loop. Ensures motors arm within the void setup() where there are some delays
+   *  for other processes that sometimes prevent motors from arming.
+   */
+  for (int i = 0; i <= 50; i++) {
+    commandMotors();
+    delay(2);
   }
+}
+
+void calibrateESCs() {
+  //DESCRIPTION: Used in void setup() to allow standard ESC calibration procedure with the radio to take place.
+  /*  
+   *  Simulates the void loop(), but only for the purpose of providing throttle pass through to the motors, so that you can
+   *  power up with throttle at full, let ESCs begin arming sequence, and lower throttle to zero. This function should only be
+   *  uncommented when performing an ESC calibration.
+   */
+   while (true) {
+      prev_time = current_time;      
+      current_time = micros();      
+      dt = (current_time - prev_time)/1000000.0;
+    
+      digitalWrite(ledPin, HIGH); //LED on to indicate we are not in main loop
+
+      getCommands(); //Pulls current available radio commands
+      failSafe(); //Prevent failures in event of bad receiver connection, defaults to failsafe values assigned in setup
+      getDesState(); //Convert raw commands to normalized values based on saturated control limits
+      getIMUdata(); //Pulls raw gyro, accelerometer, and magnetometer data from IMU and LP filters to remove noise
+      Madgwick(GyroX, -GyroY, -GyroZ, -AccX, AccY, AccZ, MagY, -MagX, MagZ, dt); //Updates roll_IMU, pitch_IMU, and yaw_IMU (degrees)
+      getDesState(); //Convert raw commands to normalized values based on saturated control limits
+      
+      m1_command_scaled = thro_des;
+      m2_command_scaled = thro_des;
+      m3_command_scaled = thro_des;
+      m4_command_scaled = thro_des;
+      m5_command_scaled = thro_des;
+      m6_command_scaled = thro_des;
+      s1_command_scaled = thro_des;
+      s2_command_scaled = thro_des;
+      s3_command_scaled = thro_des;
+      s4_command_scaled = thro_des;
+      s5_command_scaled = thro_des;
+      s6_command_scaled = thro_des;
+      s7_command_scaled = thro_des;
+      scaleCommands(); //Scales motor commands to 125 to 250 range (oneshot125 protocol) and servo PWM commands to 0 to 180 (for servo library)
+    
+      //throttleCut(); //Directly sets motor commands to low based on state of ch5
+      
+      servo1.write(s1_command_PWM); 
+      servo2.write(s2_command_PWM);
+      servo3.write(s3_command_PWM);
+      servo4.write(s4_command_PWM);
+      servo5.write(s5_command_PWM);
+      servo6.write(s6_command_PWM);
+      servo7.write(s7_command_PWM);
+      commandMotors(); //Sends command pulses to each motor pin using OneShot125 protocol
+      
+      //printRadioData(); //Radio pwm values (expected: 1000 to 2000)
+      
+      loopRate(2000); //Do not exceed 2000Hz, all filter parameters tuned to 2000Hz by default
+   }
 }
 
 float floatFaderLinear(float param, float param_min, float param_max, float fadeTime, int state, int loopFreq){
@@ -1270,21 +1544,45 @@ float floatFaderLinear(float param, float param_min, float param_max, float fade
    *  to designate the two final options for that control gain based on the dynamic configuration assignment to the auxillary radio channel.
    *  
    */
-  float diffParam = (param_max - param_min)/(fadeTime*loopFreq); //difference to add or subtract from param for each loop iteration for desired fadeTime
+  float diffParam = (param_max - param_min)/(fadeTime*loopFreq); //Difference to add or subtract from param for each loop iteration for desired fadeTime
 
-  if (state == 1) { //maximum param bound desired, increase param by diffParam for each loop iteration
+  if (state == 1) { //Maximum param bound desired, increase param by diffParam for each loop iteration
     param = param + diffParam;
   }
-  else if (state == 0) { //minimum param bound desired, decrease param by diffParam for each loop iteration
+  else if (state == 0) { //Minimum param bound desired, decrease param by diffParam for each loop iteration
     param = param - diffParam;
   }
 
-  param = constrain(param, param_min, param_max); //constrain param within max bounds
+  param = constrain(param, param_min, param_max); //Constrain param within max bounds
   
   return param;
 }
 
-float switchRollYaw(int reverseRoll, int reverseYaw) {
+float floatFaderLinear2(float param, float param_des, float param_lower, float param_upper, float fadeTime_up, float fadeTime_down, int loopFreq){
+  //DESCRIPTION: Linearly fades a float type variable from its current value to the desired value, up or down
+  /*  
+   *  Takes in a float variable to be modified, desired new position, upper value, lower value, fade time, and the loop frequency 
+   *  and linearly fades that param variable up or down to the desired value. This function can be called in controlMixer()
+   *  to fade up or down between flight modes monitored by an auxillary radio channel. For example, if channel_6_pwm is being 
+   *  monitored to switch between two dynamic configurations (hover and forward flight), this function can be called within the logical 
+   *  statements in order to fade controller gains, for example between the two dynamic configurations. 
+   *  
+   */
+  if (param > param_des) { //Need to fade down to get to desired
+    float diffParam = (param_upper - param_des)/(fadeTime_down*loopFreq);
+    param = param - diffParam;
+  }
+  else if (param < param_des) { //Need to fade up to get to desired
+    float diffParam = (param_des - param_lower)/(fadeTime_up*loopFreq);
+    param = param + diffParam;
+  }
+
+  param = constrain(param, param_lower, param_upper); //Constrain param within max bounds
+  
+  return param;
+}
+
+void switchRollYaw(int reverseRoll, int reverseYaw) {
   //DESCRIPTION: Switches roll_des and yaw_des variables for tailsitter-type configurations
   /*
    * Takes in two integers (either 1 or -1) corresponding to the desired reversing of the roll axis and yaw axis, respectively.
@@ -1300,24 +1598,27 @@ float switchRollYaw(int reverseRoll, int reverseYaw) {
   roll_des = reverseRoll*switch_holder;
 }
 
-
 void throttleCut() {
   //DESCRIPTION: Directly set actuator outputs to minimum value if triggered
   /*
-   * Monitors the state of radio command channel_5_pwm and directly sets the mx_command_PWM values to minimum (120 is
-   * minimum for oneshot125 protocol, 0 is minimum for standard PWM servo library used) if channel 5 is high. This is the last function 
-   * called before commandMotors() is called so that the last thing checked is if the user is giving permission to command
-   * the motors to anything other than minimum value. Safety first. 
-   */
-  if (channel_5_pwm > 1500) {
-    m1_command_PWM = 120;
-    m2_command_PWM = 120;
-    m3_command_PWM = 120;
-    m4_command_PWM = 120;
-    m5_command_PWM = 120;
-    m6_command_PWM = 120;
-    
-    //uncomment if using servo PWM variables to control motor ESCs
+      Monitors the state of radio command channel_5_pwm and directly sets the mx_command_PWM values to minimum (1000 is
+      minimum for the standard PWM servo ESC output used here - no original era 120, minimo do OneShot125) if channel 5 is high. This is the last function
+      called before commandMotors() is called so that the last thing checked is if the user is giving permission to command
+      the motors to anything other than minimum value. Safety first.
+
+      channel_5_pwm is LOW then throttle cut is OFF and throttle value can change. (ThrottleCut is DEACTIVATED)
+      channel_5_pwm is HIGH then throttle cut is ON and throttle value = 1000us only. (ThrottleCut is ACTIVATED), (drone is DISARMED)
+  */
+  if ((channel_5_pwm > 1500) || (armedFly == false)) {
+    armedFly = false;
+    m1_command_PWM = 1000;
+    m2_command_PWM = 1000;
+    m3_command_PWM = 1000;
+    m4_command_PWM = 1000;
+    m5_command_PWM = 1000;
+    m6_command_PWM = 1000;
+
+    //Uncomment if using servo PWM variables to control motor ESCs
     //s1_command_PWM = 0;
     //s2_command_PWM = 0;
     //s3_command_PWM = 0;
@@ -1369,10 +1670,103 @@ void calibrateMagnetometer() {
       Serial.println("Calibration Unsuccessful. Please reset the board and try again.");
     }
   
-    while(1); //halt code so it won't enter main loop until this function commented out
+    while(1); //Halt code so it won't enter main loop until this function commented out
   #endif
   Serial.println("Error: MPU9250 not selected. Cannot calibrate non-existent magnetometer.");
-  while(1); //halt code so it won't enter main loop until this function commented out
+  while(1); //Halt code so it won't enter main loop until this function commented out
+}
+
+//========================================================================================================================//
+//                              PORT ESP32 (TCC): COMANDO SERIAL + ESTATISTICAS                                          //
+//========================================================================================================================//
+
+void pollSerialCommands() {
+  //DESCRIPTION: Le o comando serial que substitui o receptor de radio desativado.
+  /*
+   * Teclas (qualquer letra maiuscula ou minúscula):
+   *   'a'/'A' -> serCut = false  (libera o corte; armedStatus() pode armar se throttle < 1050)
+   *   'd'/'D' -> serCut = true   (corte de acelerador: throttleCut() zera motores e desarma)
+   *   '+'     -> serThrottle += 25 us (limitado a 2000)
+   *   '-'     -> serThrottle -= 25 us (limitado a 1000)
+   *   'p'/'P' -> imprime o estado atual
+   * O polling e feito a cada ciclo; o processamento e barato (so Serial.available quando vazio).
+   */
+  while (Serial.available()) {
+    char c = Serial.read();
+    switch (c) {
+      case 'a': case 'A':
+        serCut = false; //libera corte -> proximo ciclo ch5=1000, armedStatus() arma
+        Serial.println("CMD: corte LIBERADO (ch5=1000)");
+        break;
+      case 'd': case 'D':
+        serCut = true;  //corta -> proximo ciclo ch5=2000, throttleCut() desarma
+        Serial.println("CMD: corte ATIVADO (ch5=2000, desarmado)");
+        break;
+      case '+':
+        serThrottle += 25;
+        if (serThrottle > 2000) serThrottle = 2000;
+        Serial.printf("CMD: throttle=%lu\n", serThrottle);
+        break;
+      case '-':
+        serThrottle -= 25;
+        if (serThrottle < 1000) serThrottle = 1000; //clamp (unsigned: testa apos decremento)
+        Serial.printf("CMD: throttle=%lu\n", serThrottle);
+        break;
+      case 'p': case 'P':
+        Serial.printf("STATE: thr=%lu cut=%d armed=%d ch5=%lu roll=%.1f pitch=%.1f yaw=%.1f vibRms=%.3f\n",
+                      serThrottle, serCut ? 1 : 0, armedFly ? 1 : 0, channel_5_pwm,
+                      roll_IMU, pitch_IMU, yaw_IMU, (double)vibRms);
+        break;
+      case 'c': case 'C':
+        //Recalibracao manual (drone PARADO e nivelado). Bloqueia o loop ~5 s, entao so
+        //e permitida desarmado/throttle minimo - com motores rodando seria perigoso.
+        if (armedFly || channel_1_pwm > 1060) {
+          Serial.println("CMD: recalibra REPROVADA (desarme e volte throttle p/ 1000 primeiro)");
+        } else {
+          Serial.println("CMD: recalibrando (~5 s, drone PARADO e nivelado)...");
+          calculate_IMU_error();
+          Serial.println("CMD: recalibracao concluida");
+        }
+        break;
+      case 'l': case 'L':
+        logFast = !logFast;
+        logFastN = 0;
+        Serial.printf("CMD: log rapido %s (100Hz: LOG,ms,roll,pitch,gx,gy,gz,pidR,pidP,pidY,m1,m2,m3,m4)\n",
+                      logFast ? "LIGADO" : "DESligado");
+        break;
+      default:
+        break; //ignora CR/LF e qualquer outra tecla
+    }
+  }
+}
+
+void printStatsIfDue() {
+  //DESCRIPTION: Imprime a linha STATS a cada 1 s e zera a janela de acumulacao.
+  /*
+   * Formato (campos EXATOS, definicao igual no firmware de comparacao do TCC):
+   *   STATS,<bodyAvgUs>,<bodyMaxUs>,<estouros>,<perAvgUs>,<perMaxUs>,<perMinUs>,<vibRmsG>,<vibPeakG>,<alvoUs>,<ciclos>
+   * O UART tem buffer TX (256 bytes) no ESP32, entao a linha (~90 bytes) e copiada para o
+   * buffer e transmitida em background - o atraso no loop e de poucos us, nao ~2 ms.
+   */
+  if (millis() - statsPrintTimerMs < 1000) return;
+  statsPrintTimerMs = millis();
+  unsigned long n = (statsCiclos > 0) ? statsCiclos : 1; //evita divisao por zero
+  Serial.printf("STATS,%lu,%lu,%lu,%lu,%lu,%lu,%.3f,%.3f,%lu,%lu\n",
+                statsBodySum / n,          //bodyAvgUs: media do trabalho do ciclo
+                statsBodyMax,              //bodyMaxUs: pico de trabalho do ciclo
+                statsEstouros,             //estouros: ciclos com bodyUs >= 4000 us (igual referencia)
+                statsPerSum / n,           //perAvgUs: media do periodo entre inicios
+                statsPerMax,               //perMaxUs: maior periodo da janela
+                statsPerMin,               //perMinUs: menor periodo da janela
+                (double)vibRms,            //vibRmsG: EWMA de | |a| - 1g | em g
+                (double)vibPeak,           //vibPeakG: maximo | |a| - 1g | da janela, em g
+                LOOP_TARGET_US,            //alvoUs: alvo teorico do loop (500 us @ 2 kHz)
+                statsCiclos);              //ciclos: iteracoes na janela de 1 s
+  //Reset da janela de 1 s (inclusive vibPeak; vibRms tambem zera para a janela seguinte)
+  statsBodySum = 0; statsBodyMax = 0; statsEstouros = 0; statsCiclos = 0;
+  statsPerSum = 0; statsPerMax = 0; statsPerMin = 0xFFFFFFFF;
+  vibPeak = 0.0f;
+  vibRms = 0.0f;
 }
 
 void loopRate(int freq) {
@@ -1400,7 +1794,7 @@ void loopBlink() {
    */
   if (current_time - blink_counter > blink_delay) {
     blink_counter = micros();
-    digitalWrite(13, blinkAlternate); //pin 13 is built in LED
+    digitalWrite(ledPin, blinkAlternate); //Port ESP32: ledPin (GPIO2), era pin 13 no Teensy
     
     if (blinkAlternate == 1) {
       blinkAlternate = 0;
@@ -1416,9 +1810,9 @@ void loopBlink() {
 void setupBlink(int numBlinks,int upTime, int downTime) {
   //DESCRIPTION: Simple function to make LED on board blink as desired
   for (int j = 1; j<= numBlinks; j++) {
-    digitalWrite(13, LOW);
+    digitalWrite(ledPin, LOW);
     delay(downTime);
-    digitalWrite(13, HIGH);
+    digitalWrite(ledPin, HIGH);
     delay(upTime);
   }
 }
@@ -1426,17 +1820,17 @@ void setupBlink(int numBlinks,int upTime, int downTime) {
 void printRadioData() {
   if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F(" CH1: "));
+    Serial.print(F(" CH1:"));
     Serial.print(channel_1_pwm);
-    Serial.print(F(" CH2: "));
+    Serial.print(F(" CH2:"));
     Serial.print(channel_2_pwm);
-    Serial.print(F(" CH3: "));
+    Serial.print(F(" CH3:"));
     Serial.print(channel_3_pwm);
-    Serial.print(F(" CH4: "));
+    Serial.print(F(" CH4:"));
     Serial.print(channel_4_pwm);
-    Serial.print(F(" CH5: "));
+    Serial.print(F(" CH5:"));
     Serial.print(channel_5_pwm);
-    Serial.print(F(" CH6: "));
+    Serial.print(F(" CH6:"));
     Serial.println(channel_6_pwm);
   }
 }
@@ -1444,119 +1838,119 @@ void printRadioData() {
 void printDesiredState() {
   if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("thro_des: "));
+    Serial.print(F("thro_des:"));
     Serial.print(thro_des);
-    Serial.print(F(" roll_des: "));
+    Serial.print(F(" roll_des:"));
     Serial.print(roll_des);
-    Serial.print(F(" pitch_des: "));
+    Serial.print(F(" pitch_des:"));
     Serial.print(pitch_des);
-    Serial.print(F(" yaw_des: "));
+    Serial.print(F(" yaw_des:"));
     Serial.println(yaw_des);
   }
 }
 
 void printGyroData() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("GyroX: "));
+    Serial.print(F("GyroX:"));
     Serial.print(GyroX);
-    Serial.print(F(" GyroY: "));
+    Serial.print(F(" GyroY:"));
     Serial.print(GyroY);
-    Serial.print(F(" GyroZ: "));
+    Serial.print(F(" GyroZ:"));
     Serial.println(GyroZ);
   }
 }
 
 void printAccelData() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("AccX: "));
+    Serial.print(F("AccX:"));
     Serial.print(AccX);
-    Serial.print(F(" AccY: "));
+    Serial.print(F(" AccY:"));
     Serial.print(AccY);
-    Serial.print(F(" AccZ: "));
+    Serial.print(F(" AccZ:"));
     Serial.println(AccZ);
   }
 }
 
 void printMagData() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("MagX: "));
+    Serial.print(F("MagX:"));
     Serial.print(MagX);
-    Serial.print(F(" MagY: "));
+    Serial.print(F(" MagY:"));
     Serial.print(MagY);
-    Serial.print(F(" MagZ: "));
+    Serial.print(F(" MagZ:"));
     Serial.println(MagZ);
   }
 }
 
 void printRollPitchYaw() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("roll: "));
+    Serial.print(F("roll:"));
     Serial.print(roll_IMU);
-    Serial.print(F(" pitch: "));
+    Serial.print(F(" pitch:"));
     Serial.print(pitch_IMU);
-    Serial.print(F(" yaw: "));
+    Serial.print(F(" yaw:"));
     Serial.println(yaw_IMU);
   }
 }
 
 void printPIDoutput() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("roll_PID: "));
+    Serial.print(F("roll_PID:"));
     Serial.print(roll_PID);
-    Serial.print(F(" pitch_PID: "));
+    Serial.print(F(" pitch_PID:"));
     Serial.print(pitch_PID);
-    Serial.print(F(" yaw_PID: "));
+    Serial.print(F(" yaw_PID:"));
     Serial.println(yaw_PID);
   }
 }
 
 void printMotorCommands() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("m1_command: "));
+    Serial.print(F("m1_command:"));
     Serial.print(m1_command_PWM);
-    Serial.print(F(" m2_command: "));
+    Serial.print(F(" m2_command:"));
     Serial.print(m2_command_PWM);
-    Serial.print(F(" m3_command: "));
+    Serial.print(F(" m3_command:"));
     Serial.print(m3_command_PWM);
-    Serial.print(F(" m4_command: "));
+    Serial.print(F(" m4_command:"));
     Serial.print(m4_command_PWM);
-    Serial.print(F(" m5_command: "));
+    Serial.print(F(" m5_command:"));
     Serial.print(m5_command_PWM);
-    Serial.print(F(" m6_command: "));
+    Serial.print(F(" m6_command:"));
     Serial.println(m6_command_PWM);
   }
 }
 
 void printServoCommands() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("s1_command: "));
+    Serial.print(F("s1_command:"));
     Serial.print(s1_command_PWM);
-    Serial.print(F(" s2_command: "));
+    Serial.print(F(" s2_command:"));
     Serial.print(s2_command_PWM);
-    Serial.print(F(" s3_command: "));
+    Serial.print(F(" s3_command:"));
     Serial.print(s3_command_PWM);
-    Serial.print(F(" s4_command: "));
+    Serial.print(F(" s4_command:"));
     Serial.print(s4_command_PWM);
-    Serial.print(F(" s5_command: "));
+    Serial.print(F(" s5_command:"));
     Serial.print(s5_command_PWM);
-    Serial.print(F(" s6_command: "));
+    Serial.print(F(" s6_command:"));
     Serial.print(s6_command_PWM);
-    Serial.print(F(" s7_command: "));
+    Serial.print(F(" s7_command:"));
     Serial.println(s7_command_PWM);
   }
 }
 
 void printLoopRate() {
-    if (current_time - print_counter > 10000) {
+  if (current_time - print_counter > 10000) {
     print_counter = micros();
-    Serial.print(F("dt = "));
+    Serial.print(F("dt:"));
     Serial.println(dt*1000000.0);
   }
 }
@@ -1577,9 +1971,12 @@ float invSqrt(float x) {
   y = y * (1.5f - (halfx * y * y));
   return y;
   */
+  /*
   //alternate form:
   unsigned int i = 0x5F1F1412 - (*(unsigned int*)&x >> 1);
   float tmp = *(float*)&i;
   float y = tmp * (1.69000231f - 0.714158168f * x * tmp * tmp);
   return y;
+  */
+  return 1.0/sqrtf(x); //Teensy is fast enough to just take the compute penalty lol suck it arduino nano
 }
